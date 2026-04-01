@@ -10,14 +10,25 @@ Multi-GPU: each chunk is placed on a different device via round-robin.
 
 from __future__ import annotations
 import time
+import os
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from typing import Optional
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 import MDAnalysis as mda
+
+def _read_traj_chunk_wrapper(args):
+    topo_path, traj_path, frames = args
+    u = mda.Universe(topo_path, traj_path)
+    out = []
+    for f in frames:
+        u.trajectory[f]
+        out.append(u.atoms.positions.copy())
+    return np.stack(out, axis=0), frames
 from MDAnalysis.coordinates.memory import MemoryReader
 
 from .topology import parse_topology, ChemicalGroups
@@ -198,51 +209,38 @@ def compute_contacts(
         jax_coords = jax.device_put(jnp.array(chunk_xyz), device)
         frame_offset = frame_offsets[0]
         contacts = []
-        if "sb" in itypes:
-            contacts += compute_salt_bridges(jax_coords, groups, geom, frame_offset, masks["sb"])
-        if "hp" in itypes:
-            contacts += compute_hydrophobics(jax_coords, groups, geom, frame_offset, masks["hp"])
-        if "vdw" in itypes:
-            contacts += compute_vanderwaals(jax_coords, groups, geom, frame_offset,
-                                             masks["vdw_pair"], masks["vdw_cut"])
-        if "hb" in itypes:
-            contacts += compute_hbonds(jax_coords, groups, geom, frame_offset, masks["hb"])
-        if "ps" in itypes:
-            contacts += compute_pi_stacking(jax_coords, groups, geom, frame_offset, masks["rings"])
-        if "ts" in itypes:
-            contacts += compute_t_stacking(jax_coords, groups, geom, frame_offset, masks["rings"])
-        if "pc" in itypes:
-            contacts += compute_pi_cation(jax_coords, groups, geom, frame_offset, masks["pc"])
+        if "sb" in itypes: contacts += compute_salt_bridges(jax_coords, groups, geom, frame_offset, masks["sb"])
+        if "hp" in itypes: contacts += compute_hydrophobics(jax_coords, groups, geom, frame_offset, masks["hp"])
+        if "vdw" in itypes: contacts += compute_vanderwaals(jax_coords, groups, geom, frame_offset, masks["vdw_pair"], masks["vdw_cut"])
+        if "hb" in itypes: contacts += compute_hbonds(jax_coords, groups, geom, frame_offset, masks["hb"])
+        if "ps" in itypes: contacts += compute_pi_stacking(jax_coords, groups, geom, frame_offset, masks["rings"])
+        if "ts" in itypes: contacts += compute_t_stacking(jax_coords, groups, geom, frame_offset, masks["rings"])
+        if "pc" in itypes: contacts += compute_pi_cation(jax_coords, groups, geom, frame_offset, masks["pc"])
         return contacts
 
-    chunk_xyz_buf, chunk_frames_buf = [], []
     futures = []
+    chunked_frames = [frames_to_process[i:i + chunk_size] for i in range(0, len(frames_to_process), chunk_size)]
 
-    with ThreadPoolExecutor(max_workers=max(1, len(devices))) as executor:
-        def _flush(xyz_list, frame_list, device):
-            chunk = np.stack(xyz_list, axis=0)  # (F, N, 3)
-            return executor.submit(_process_chunk, chunk, frame_list, device)
+    with ThreadPoolExecutor(max_workers=max(1, len(devices))) as gpu_executor:
+        if trajectory:
+            max_workers = min(os.cpu_count() or 4, 8)
+            print(f"[ultracontacts] Launching Asynchronous Dataloader ({max_workers} processes)...")
+            args_list = [(topology, trajectory, cf) for cf in chunked_frames]
+            
+            with ProcessPoolExecutor(max_workers=max_workers) as loader_executor:
+                device_idx = 0
+                for chunk_xyz, chunk_frames in loader_executor.map(_read_traj_chunk_wrapper, args_list):
+                    device = devices[device_idx % len(devices)]
+                    device_idx += 1
+                    futures.append((gpu_executor.submit(_process_chunk, chunk_xyz, chunk_frames, device), chunk_frames[0]))
+        else:
+            # Single PDB Evaluation
+            chunk_xyz = np.stack([u.atoms.positions.copy()])
+            chunk_frames = [0]
+            device = devices[0]
+            futures.append((gpu_executor.submit(_process_chunk, chunk_xyz, chunk_frames, device), chunk_frames[0]))
 
-        device_idx = 0
-        for abs_frame in frames_to_process:
-            u.trajectory[abs_frame]
-            chunk_xyz_buf.append(u.atoms.positions.copy())
-            chunk_frames_buf.append(abs_frame)
-
-            if len(chunk_xyz_buf) >= chunk_size:
-                device = devices[device_idx % len(devices)]
-                futures.append((_flush(chunk_xyz_buf, chunk_frames_buf, device),
-                                chunk_frames_buf[0]))
-                chunk_xyz_buf, chunk_frames_buf = [], []
-                device_idx += 1
-
-        # Flush remainder
-        if chunk_xyz_buf:
-            device = devices[device_idx % len(devices)]
-            futures.append((_flush(chunk_xyz_buf, chunk_frames_buf, device),
-                            chunk_frames_buf[0]))
-
-        # Collect and write results as futures complete
+        # Collect and write results as sequentially queued to preserve exact original order
         for fut, first_frame in futures:
             contacts = fut.result()
             if contacts:

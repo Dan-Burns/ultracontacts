@@ -44,7 +44,7 @@ def fused_dist_mask(a: jnp.ndarray, b: jnp.ndarray, max_d_sq: jnp.ndarray | floa
     b_sq = jnp.sum(b * b, axis=-1)[..., None, :]
     ab = jnp.matmul(a, jnp.swapaxes(b, -1, -2))
     dists_sq = jnp.clip(a_sq + b_sq - 2.0 * ab, 0.0, None)
-    return dists_sq <= max_d_sq
+    return dists_sq < max_d_sq
 
 
 @jax.jit
@@ -58,11 +58,11 @@ def fused_hbond_mask(
     """
     GEMM implementation of Hydrogen Bonds without (F, D, A, 3) diff arrays.
     """
-    # 1. Distance H..A using Matmul
-    h_sq = jnp.sum(hydrogen_xyz * hydrogen_xyz, axis=-1)[..., :, None]
+    # 1. Distance D..A using Matmul
+    d_sq = jnp.sum(donor_xyz * donor_xyz, axis=-1)[..., :, None]
     a_sq = jnp.sum(acceptor_xyz * acceptor_xyz, axis=-1)[..., None, :]
-    ha_dot = jnp.matmul(hydrogen_xyz, jnp.swapaxes(acceptor_xyz, -1, -2))
-    dists_sq = jnp.clip(h_sq + a_sq - 2.0 * ha_dot, 0.0, None)
+    da_dot = jnp.matmul(donor_xyz, jnp.swapaxes(acceptor_xyz, -1, -2))
+    dists_sq = jnp.clip(d_sq + a_sq - 2.0 * da_dot, 0.0, None)
     
     # 2. Angle calculation
     dh = hydrogen_xyz - donor_xyz                                     # (F, D, 3)
@@ -70,7 +70,12 @@ def fused_hbond_mask(
     dh_norm = jnp.sqrt(dh_norm_sq)
     dh_norm = jnp.where(dh_norm < 1e-8, 1.0, dh_norm)
     
-    ha_norm = jnp.sqrt(dists_sq)                                      # (F, D, A)
+    # Needs ha_norm for angle, distance between H and A
+    h_sq = jnp.sum(hydrogen_xyz * hydrogen_xyz, axis=-1)[..., :, None]
+    ha_dot = jnp.matmul(hydrogen_xyz, jnp.swapaxes(acceptor_xyz, -1, -2))
+    ha_dists_sq = jnp.clip(h_sq + a_sq - 2.0 * ha_dot, 0.0, None)
+    
+    ha_norm = jnp.sqrt(ha_dists_sq)                                   # (F, D, A)
     ha_norm = jnp.where(ha_norm < 1e-8, 1.0, ha_norm)
     
     # dh \cdot (a - h) = dh \cdot a  -  dh \cdot h
@@ -81,7 +86,7 @@ def fused_hbond_mask(
     cos_angle = cos_angle_num / (dh_norm * ha_norm)
     angles = jnp.degrees(jnp.arccos(jnp.clip(cos_angle, -1.0, 1.0)))
     
-    return (dists_sq <= max_d_sq) & (angles >= min_angle)
+    return (dists_sq < max_d_sq) & (angles >= min_angle)
 
 
 @jax.jit
@@ -120,7 +125,7 @@ def fused_pi_stacking_mask(
     
     psi = jnp.minimum(psi1, psi2)
     ang_ok = (plane_angle < ang_cut)
-    return (cent_dists_sq <= dist_cut_sq) & ang_ok & (psi < psi_cut)
+    return (cent_dists_sq < dist_cut_sq) & ang_ok & (psi < psi_cut)
 
 
 @jax.jit
@@ -156,7 +161,7 @@ def fused_t_stacking_mask(
     
     psi = jnp.minimum(psi1, psi2)
     ang_ok = (jnp.abs(plane_angle - 90.0) < ang_cut)
-    return (cent_dists_sq <= dist_cut_sq) & ang_ok & (psi < psi_cut)
+    return (cent_dists_sq < dist_cut_sq) & ang_ok & (psi < psi_cut)
 
 
 @jax.jit
@@ -185,4 +190,4 @@ def fused_pi_cation_mask(
     dot = jnp.clip(proj / vec_norm, 0.0, 1.0)
     angle = jnp.degrees(jnp.arccos(dot))
     
-    return (dists_sq <= dist_cut_sq) & (offset_sq <= offset_cut**2) & (angle < ang_cut)
+    return (dists_sq < dist_cut_sq) & (offset_sq < offset_cut**2) & (angle < ang_cut)
