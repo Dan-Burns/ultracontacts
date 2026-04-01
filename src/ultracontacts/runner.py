@@ -245,30 +245,50 @@ def compute_contacts(
 
     with ThreadPoolExecutor(max_workers=max(1, len(devices))) as gpu_executor:
         if trajectory:
+            import multiprocessing as mp
+            ctx = mp.get_context("spawn")
             max_workers = min(os.cpu_count() or 4, 8)
             print(f"[ultracontacts] Launching Asynchronous Dataloader ({max_workers} processes)...")
             
-            with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_worker, initargs=(str(topology), str(trajectory))) as loader_executor:
+            with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx, initializer=_init_worker, initargs=(str(topology), str(trajectory))) as loader_executor:
                 device_idx = 0
                 for chunk_xyz, chunk_frames in loader_executor.map(_read_traj_chunk_wrapper, chunked_frames):
                     device = devices[device_idx % len(devices)]
                     device_idx += 1
-                    futures.append((gpu_executor.submit(_process_chunk, chunk_xyz, chunk_frames, device), chunk_frames[0]))
+                    
+                    # Submit to GPU thread and append to queue
+                    fut = gpu_executor.submit(_process_chunk, chunk_xyz, chunk_frames, device)
+                    futures.append((fut, chunk_frames[0]))
+                    
+                    # Interleaved PyArrow Writer (Check the oldest future in the pipeline to write in exact chronological order without hanging memory)
+                    while len(futures) > 0 and futures[0][0].done():
+                        done_fut, _ = futures.pop(0)
+                        contacts = done_fut.result()
+                        if len(contacts[0]) > 0:
+                            with write_lock:
+                                parquet_writer[0] = write_parquet_chunk(
+                                    contacts, output, parquet_writer[0], itypes, beg, end, stride
+                                )
+
+            # Flush the remaining futures sequentially
+            for fut, _ in futures:
+                contacts = fut.result()
+                if len(contacts[0]) > 0:
+                    with write_lock:
+                        parquet_writer[0] = write_parquet_chunk(
+                            contacts, output, parquet_writer[0], itypes, beg, end, stride
+                        )
         else:
             # Single PDB Evaluation
             chunk_xyz = np.stack([u.atoms.positions.copy()])
             chunk_frames = [0]
             device = devices[0]
-            futures.append((gpu_executor.submit(_process_chunk, chunk_xyz, chunk_frames, device), chunk_frames[0]))
-
-        # Collect and write results as sequentially queued to preserve exact original order
-        for fut, first_frame in futures:
+            fut = gpu_executor.submit(_process_chunk, chunk_xyz, chunk_frames, device)
             contacts = fut.result()
             if len(contacts[0]) > 0:
-                with write_lock:
-                    parquet_writer[0] = write_parquet_chunk(
-                        contacts, output, parquet_writer[0], itypes, beg, end, stride
-                    )
+                 parquet_writer[0] = write_parquet_chunk(
+                     contacts, output, parquet_writer[0], itypes, beg, end, stride
+                 )
 
     finalize_parquet(parquet_writer[0], output)
 
