@@ -21,13 +21,18 @@ import jax
 import jax.numpy as jnp
 import MDAnalysis as mda
 
-def _read_traj_chunk_wrapper(args):
-    topo_path, traj_path, frames = args
-    u = mda.Universe(topo_path, traj_path)
+_worker_u = None
+
+def _init_worker(topo_path, traj_path):
+    global _worker_u
+    _worker_u = mda.Universe(topo_path, traj_path)
+
+def _read_traj_chunk_wrapper(frames):
+    global _worker_u
     out = []
     for f in frames:
-        u.trajectory[f]
-        out.append(u.atoms.positions.copy())
+        _worker_u.trajectory[f]
+        out.append(_worker_u.atoms.positions.copy())
     return np.stack(out, axis=0), frames
 from MDAnalysis.coordinates.memory import MemoryReader
 
@@ -225,11 +230,10 @@ def compute_contacts(
         if trajectory:
             max_workers = min(os.cpu_count() or 4, 8)
             print(f"[ultracontacts] Launching Asynchronous Dataloader ({max_workers} processes)...")
-            args_list = [(topology, trajectory, cf) for cf in chunked_frames]
             
-            with ProcessPoolExecutor(max_workers=max_workers) as loader_executor:
+            with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_worker, initargs=(str(topology), str(trajectory))) as loader_executor:
                 device_idx = 0
-                for chunk_xyz, chunk_frames in loader_executor.map(_read_traj_chunk_wrapper, args_list):
+                for chunk_xyz, chunk_frames in loader_executor.map(_read_traj_chunk_wrapper, chunked_frames):
                     device = devices[device_idx % len(devices)]
                     device_idx += 1
                     futures.append((gpu_executor.submit(_process_chunk, chunk_xyz, chunk_frames, device), chunk_frames[0]))
