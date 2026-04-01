@@ -19,7 +19,7 @@ import numpy as np
 import jax.numpy as jnp
 
 from ..topology import ChemicalGroups, build_dual_sele_mask, build_residue_diff_mask
-from ..geometry import batch_pairwise_dist_sq, dha_angle_deg
+from ..geometry import fused_hbond_mask
 
 
 def precompute_hbond_mask(
@@ -80,24 +80,16 @@ def compute_hbonds(
         return []
 
     # Gather coordinates
-    d_xyz = coords[:, groups.donor_indices, :]    # (F, D, 3)
-    h_xyz = coords[:, groups.hydrogen_indices, :] # (F, D, 3)
+    d_xyz = coords[:, groups.donor_indices, :]     # (F, D, 3)
+    h_xyz = coords[:, groups.hydrogen_indices, :]  # (F, D, 3)
     a_xyz = coords[:, groups.acceptor_indices, :]  # (F, A, 3)
 
-    # Step 1: D···A distance filter (fast, no angle needed yet)
-    da_dist_sq = np.array(batch_pairwise_dist_sq(d_xyz, a_xyz))  # (F, D, A)
-    dist_mask = (da_dist_sq < dist_cutoff ** 2) & pair_mask[None, :, :]  # (F, D, A)
-
-    # Skip if nothing passes distance
-    if not dist_mask.any():
-        return []
-
-    # Step 2: Compute D-H···A angle only for passing pairs
-    # We compute for all pairs, but only look at dist_mask hits afterward.
-    # For typical proteins D~300, A~400, F~500 → (F,D,A) = 60M entries — manageable.
-    angles = np.array(dha_angle_deg(d_xyz, h_xyz, a_xyz))  # (F, D, A)
-
-    valid = dist_mask & (angles >= ang_cutoff)
+    bool_mask = np.array(fused_hbond_mask(
+        d_xyz, h_xyz, a_xyz,
+        dist_cutoff**2, ang_cutoff
+    ))  # (F, D, A)
+    
+    valid = bool_mask & pair_mask[None, :, :]
 
     contacts = []
     frames, d_pos, a_pos = np.nonzero(valid)

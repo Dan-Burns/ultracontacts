@@ -10,7 +10,7 @@ import numpy as np
 import jax.numpy as jnp
 
 from ..topology import ChemicalGroups, build_dual_sele_mask
-from ..geometry import batch_pairwise_dist_sq
+from ..geometry import fused_dist_mask
 
 # Cross-sele validity is pre-computed once outside the frame loop.
 
@@ -45,15 +45,13 @@ def compute_salt_bridges(
     F = coords.shape[0]
 
     # Gather anion / cation coords: (F, Na/Nc, 3)
-    an_xyz = coords[:, groups.anion_indices, :]    # (F, Na, 3)
-    cat_xyz = coords[:, groups.cation_indices, :]  # (F, Nc, 3)
+    anion_xyz = coords[:, groups.anion_indices, :]    # (F, Na, 3)
+    cation_xyz = coords[:, groups.cation_indices, :]  # (F, Nc, 3)
 
-    # Pairwise distances²: (F, Na, Nc)
-    dists_sq = np.array(batch_pairwise_dist_sq(an_xyz, cat_xyz))
+    # GPU Fused evaluation
+    bool_mask = np.array(fused_dist_mask(anion_xyz, cation_xyz, cutoff ** 2))
 
-    cutoff_sq = cutoff * cutoff
-    # Apply distance + sele mask
-    valid = (dists_sq < cutoff_sq) & sele_mask[None, :, :]  # (F, Na, Nc)
+    valid = bool_mask & sele_mask[None, :, :]
 
     contacts = []
     frames, an_pos, cat_pos = np.nonzero(valid)

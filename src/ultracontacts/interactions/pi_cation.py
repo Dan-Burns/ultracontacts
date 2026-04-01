@@ -12,7 +12,7 @@ import numpy as np
 import jax.numpy as jnp
 
 from ..topology import ChemicalGroups, build_dual_sele_mask
-from ..geometry import ring_centroids, ring_normals, centroid_to_atoms_dist_sq, centroid_to_atom_angle_deg
+from ..geometry import fused_pi_cation_mask
 
 
 def precompute_pc_mask(groups: ChemicalGroups) -> np.ndarray:
@@ -52,27 +52,17 @@ def compute_pi_cation(
 
     # Ring geometry
     ring_xyz = coords[:, groups.ring_indices, :].reshape(F, R, 3, 3)  # (F, R, 3, 3)
-    cents = np.array(ring_centroids(ring_xyz))   # (F, R, 3)
-    norms = np.array(ring_normals(ring_xyz))     # (F, R, 3)
 
     # Cation coords
     cat_xyz = coords[:, groups.cation_indices, :]   # (F, Nc, 3)
 
-    # Centroid→cation distances²: (F, R, Nc)
-    dist_sq = np.array(centroid_to_atoms_dist_sq(
-        jnp.array(cents), jnp.array(cat_xyz)
-    ))
+    # Boolean mask evaluation in a single fused JAX GPU kernel
+    bool_mask = np.array(fused_pi_cation_mask(
+        ring_xyz, cat_xyz,
+        dist_cut ** 2, 1000.0, ang_cut
+    ))  # (F, R, C)
 
-    # Angle: ring normal vs centroid→cation vector: (F, R, Nc)
-    angles = np.array(centroid_to_atom_angle_deg(
-        jnp.array(cents), jnp.array(norms), jnp.array(cat_xyz)
-    ))
-
-    valid = (
-        (dist_sq < dist_cut ** 2) &
-        (angles < ang_cut) &
-        pc_mask[None, :, :]
-    )
+    valid = bool_mask & pc_mask[None, :, :]
 
     contacts = []
     frames, ri, ci = np.nonzero(valid)

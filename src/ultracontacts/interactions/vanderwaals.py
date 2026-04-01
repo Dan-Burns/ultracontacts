@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 
 from ..topology import ChemicalGroups, build_dual_sele_mask, build_residue_diff_mask
-from ..geometry import batch_pairwise_dist_sq
+from ..geometry import fused_dist_mask
 
 # Maximum atoms per batch side to cap (V1*V2*F) tensor memory (~2 GB budget)
 _MAX_ATOMS_PER_SIDE = 2000
@@ -98,10 +98,11 @@ def compute_vanderwaals(
 
             idx2_sub = groups.vdw_indices2[j0:j1]
             xyz2 = coords[:, idx2_sub, :]            # (F, c2, 3)
-            dists_sq = np.array(batch_pairwise_dist_sq(xyz1, xyz2))  # (F, c1, c2)
-
             sub_cut = cut_chunk[:, j0:j1]            # (c1, c2)
-            valid = (dists_sq < (sub_cut ** 2)[None, :, :]) & sub_mask[None, :, :]
+            
+            bool_mask = np.array(fused_dist_mask(xyz1, xyz2, jnp.array(sub_cut ** 2))) # (F, c1, c2)
+
+            valid = bool_mask & sub_mask[None, :, :]
 
             ff, ii, jj = np.nonzero(valid)
             for f, i, j in zip(ff, ii, jj):

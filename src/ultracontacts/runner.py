@@ -172,11 +172,13 @@ def compute_contacts(
     # VdW is internally atom-chunked (max 2000x2000 = 4M elements per block), so we cap its contribution
     if "vdw" in itypes: max_pairs = max(max_pairs, min(len(groups.vdw_indices1) * len(groups.vdw_indices2), 4_000_000))
 
-    # XLA limit is ~2GB array size per tensor. We limit combinations per chunk to 100M floats (~400 MB).
-    safe_chunk_size = max(1, 100_000_000 // max_pairs)
+    # XLA limit is ~2GB array size per tensor. Because we now use Fused Boolean Masks,
+    # the returned array is 1-byte per element instead of 4-byte float32 elements.
+    # We can comfortably limit chunking combinations to 500 Million pairs (~500 MB output).
+    safe_chunk_size = max(1, 500_000_000 // max_pairs)
     if chunk_size > safe_chunk_size:
         print(f"[ultracontacts] Dense topology detected (Max pairwise density: {max_pairs:,} pairs/frame).")
-        print(f"[ultracontacts] Auto-tuning chunk_size from {chunk_size} -> {safe_chunk_size} GPU batch to prevent XLA OOM limits.")
+        print(f"[ultracontacts] Auto-tuning chunk_size from {chunk_size} -> {safe_chunk_size} GPU batch to prevent bitmask OOM limits.")
         chunk_size = safe_chunk_size
 
     # ---- Frame range ----

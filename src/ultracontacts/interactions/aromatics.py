@@ -18,7 +18,7 @@ import numpy as np
 import jax.numpy as jnp
 
 from ..topology import ChemicalGroups, build_dual_sele_mask
-from ..geometry import ring_centroids, ring_normals, angle_between_normals_deg, psi_angle_deg
+from ..geometry import fused_pi_stacking_mask, fused_t_stacking_mask
 
 
 def precompute_ring_pair_mask(
@@ -70,43 +70,12 @@ def _compute_aromatics(
     F = coords.shape[0]
     ring_xyz = ring_xyz.reshape(F, R, 3, 3)         # (F, R, 3, 3)
 
-    # Centroids and normals: (F, R, 3)
-    cents = np.array(ring_centroids(ring_xyz))       # (F, R, 3)
-    norms = np.array(ring_normals(ring_xyz))         # (F, R, 3)
-
-    # Pairwise centroid distances: (F, R, R)
-    diff = cents[:, :, None, :] - cents[:, None, :, :]  # (F, R, R, 3)
-    cent_dists = np.sqrt(np.sum(diff * diff, axis=-1))   # (F, R, R)
-
-    # Plane-alignment angle: (F, R, R)
-    # angle_between_normals operates on (..., 3) — we compute for all pairs
-    n1 = norms[:, :, None, :]   # (F, R, 1, 3)
-    n2 = norms[:, None, :, :]   # (F, 1, R, 3)
-    cos_angle = np.clip(np.abs(np.sum(n1 * n2, axis=-1)), 0.0, 1.0)  # (F, R, R)
-    plane_angle = np.degrees(np.arccos(cos_angle))   # (F, R, R)
-
-    # Psi angle: min of psi(ring1→ring2) and psi(ring2→ring1)
-    vec = diff                                       # (F, R, R, 3)  c2 - c1
-    vec_norm = np.linalg.norm(vec, axis=-1, keepdims=True)
-    vec_norm = np.where(vec_norm < 1e-8, 1.0, vec_norm)
-    vec_unit = vec / vec_norm                        # (F, R, R, 3)
-    psi1 = np.degrees(np.arccos(np.clip(
-        np.abs(np.sum(vec_unit * n1, axis=-1)), 0.0, 1.0)))  # (F, R, R)
-    psi2 = np.degrees(np.arccos(np.clip(
-        np.abs(np.sum(vec_unit * n2, axis=-1)), 0.0, 1.0)))  # (F, R, R)
-    psi = np.minimum(psi1, psi2)
-
-    # Build final contact mask
-    dist_ok = cent_dists < dist_cut                          # (F, R, R)
-
     if itype == "ps":
-        ang_ok = plane_angle < ang_cut
-    else:  # ts
-        ang_ok = np.abs(plane_angle - 90.0) < ang_cut
+        bool_mask = np.array(fused_pi_stacking_mask(ring_xyz, dist_cut ** 2, ang_cut, psi_cut))
+    else:
+        bool_mask = np.array(fused_t_stacking_mask(ring_xyz, dist_cut ** 2, ang_cut, psi_cut))
 
-    psi_ok = psi < psi_cut
-
-    valid = dist_ok & ang_ok & psi_ok & ring_pair_mask[None, :, :]
+    valid = bool_mask & ring_pair_mask[None, :, :]
 
     contacts = []
     frames, ri, rj = np.nonzero(valid)

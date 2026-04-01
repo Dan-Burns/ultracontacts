@@ -10,7 +10,7 @@ import numpy as np
 import jax.numpy as jnp
 
 from ..topology import ChemicalGroups, build_dual_sele_mask, build_residue_diff_mask
-from ..geometry import batch_pairwise_dist_sq
+from ..geometry import fused_dist_mask
 
 
 def precompute_hp_mask(groups: ChemicalGroups, res_diff: int) -> np.ndarray:
@@ -42,14 +42,18 @@ def compute_hydrophobics(
     sele_mask: np.ndarray,    # (Hp, Hp) from precompute_hp_mask
 ) -> list[tuple]:
     cutoff = float(geom.get("HP_CUTOFF_DIST", 4.0))
+    max_dist_sq = cutoff * cutoff
 
     if sele_mask.size == 0 or groups.hp_indices.size == 0:
         return []
 
     hp_xyz = coords[:, groups.hp_indices, :]   # (F, Hp, 3)
-    dists_sq = np.array(batch_pairwise_dist_sq(hp_xyz, hp_xyz))  # (F, Hp, Hp)
 
-    valid = (dists_sq < cutoff * cutoff) & sele_mask[None, :, :]
+    # Boolean mask natively from GPU
+    bool_mask = np.array(fused_dist_mask(hp_xyz, hp_xyz, max_dist_sq)) # (F, Hp, Hp)
+
+    # Apply topology masks
+    valid = bool_mask & sele_mask[None, :, :]
 
     contacts = []
     frames, i_pos, j_pos = np.nonzero(valid)
