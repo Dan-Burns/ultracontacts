@@ -69,15 +69,16 @@ def compute_vanderwaals(
     frame_offset: int,
     pair_mask: np.ndarray,     # (V1, V2)
     cutoff_mat: np.ndarray,    # (V1, V2) — per-pair hard cutoff in Å
-) -> list[tuple]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     epsilon = float(geom.get("VDW_EPSILON", 0.5))
 
-    if pair_mask.size == 0:
-        return []
+    if pair_mask.size == 0 or len(groups.vdw_indices1) == 0 or len(groups.vdw_indices2) == 0:
+        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
 
     V1, V2 = pair_mask.shape
     F = coords.shape[0]
-    contacts = []
+    
+    f_arrs, a1_arrs, a2_arrs = [], [], []
 
     # Determine chunk sizes to stay within GPU memory
     chunk1 = min(V1, _MAX_ATOMS_PER_SIDE)
@@ -105,13 +106,20 @@ def compute_vanderwaals(
             valid = bool_mask & sub_mask[None, :, :]
 
             ff, ii, jj = np.nonzero(valid)
-            for f, i, j in zip(ff, ii, jj):
-                gi = i0 + i
-                gj = j0 + j
-                # skip disulfide CYS–CYS
-                contacts.append((
-                    frame_offset + int(f), "vdw",
-                    groups.vdw_labels1[gi], groups.vdw_labels2[gj],
-                ))
+            if len(ff) > 0:
+                f_arrs.append(ff.astype(np.int32) + frame_offset)
+                
+                gi_idx = i0 + ii
+                gj_idx = j0 + jj
+                a1_arrs.append(np.array(groups.vdw_labels1, dtype=object)[gi_idx])
+                a2_arrs.append(np.array(groups.vdw_labels2, dtype=object)[gj_idx])
 
-    return contacts
+    if not f_arrs:
+        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
+    
+    f_arr = np.concatenate(f_arrs)
+    a1_arr = np.concatenate(a1_arrs)
+    a2_arr = np.concatenate(a2_arrs)
+    it_arr = np.full(len(f_arr), "vdw", dtype=object)
+
+    return f_arr, it_arr, a1_arr, a2_arr

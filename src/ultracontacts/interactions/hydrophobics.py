@@ -35,17 +35,17 @@ def precompute_hp_mask(groups: ChemicalGroups, res_diff: int) -> np.ndarray:
 
 
 def compute_hydrophobics(
-    coords: jnp.ndarray,
+    coords: jnp.ndarray,       # (F, N, 3) on-device
     groups: ChemicalGroups,
     geom: dict,
     frame_offset: int,
     sele_mask: np.ndarray,    # (Hp, Hp) from precompute_hp_mask
-) -> list[tuple]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     cutoff = float(geom.get("HP_CUTOFF_DIST", 4.0))
     max_dist_sq = cutoff * cutoff
 
-    if sele_mask.size == 0 or groups.hp_indices.size == 0:
-        return []
+    if sele_mask.size == 0 or len(groups.hp_indices) == 0:
+        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
 
     hp_xyz = coords[:, groups.hp_indices, :]   # (F, Hp, 3)
 
@@ -55,11 +55,15 @@ def compute_hydrophobics(
     # Apply topology masks
     valid = bool_mask & sele_mask[None, :, :]
 
-    contacts = []
     frames, i_pos, j_pos = np.nonzero(valid)
-    for f, i, j in zip(frames, i_pos, j_pos):
-        contacts.append((
-            frame_offset + int(f), "hp",
-            groups.hp_labels[i], groups.hp_labels[j],
-        ))
-    return contacts
+    if len(frames) == 0:
+        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
+
+    abs_frames = frames.astype(np.int32) + frame_offset
+    itypes = np.full(len(frames), "hp", dtype=object)
+    
+    lbls = np.array(groups.hp_labels, dtype=object)
+    a1_arr = lbls[i_pos]
+    a2_arr = lbls[j_pos]
+
+    return abs_frames, itypes, a1_arr, a2_arr

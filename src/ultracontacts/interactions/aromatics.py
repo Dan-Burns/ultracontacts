@@ -43,27 +43,27 @@ def precompute_ring_pair_mask(
     return sele_mask
 
 
-def _compute_aromatics(
-    coords: jnp.ndarray,          # (F, N, 3)
+def _compute_stacking(
+    coords: jnp.ndarray,
     groups: ChemicalGroups,
     geom: dict,
     frame_offset: int,
-    ring_pair_mask: np.ndarray,   # (R, R)
-    itype: str,                   # "ps" or "ts"
-) -> list[tuple]:
+    ring_pair_mask: np.ndarray,      # (R, R) bool
+    itype: str,                      # "ps" or "ts"
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 
-    R = len(groups.ring_indices)
-    if R == 0 or ring_pair_mask.size == 0:
-        return []
-
+    # Parse appropriate cutoffs
     if itype == "ps":
         dist_cut = float(geom.get("PS_CUTOFF_DIST", 7.0))
         ang_cut = float(geom.get("PS_CUTOFF_ANG", 30.0))
         psi_cut = float(geom.get("PS_PSI_ANG", 45.0))
-    else:
+    else:  # ts
         dist_cut = float(geom.get("TS_CUTOFF_DIST", 5.0))
         ang_cut = float(geom.get("TS_CUTOFF_ANG", 30.0))
         psi_cut = float(geom.get("TS_PSI_ANG", 45.0))
+
+    if ring_pair_mask.size == 0 or len(groups.ring_indices) == 0:
+        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
 
     # Gather ring atom coords: (F, R, 3, 3)
     ring_xyz = coords[:, groups.ring_indices, :]    # (F, R*3, 3)
@@ -75,16 +75,18 @@ def _compute_aromatics(
     else:
         bool_mask = np.array(fused_t_stacking_mask(ring_xyz, dist_cut ** 2, ang_cut, psi_cut))
 
-    valid = bool_mask & ring_pair_mask[None, :, :]
-
-    contacts = []
     frames, ri, rj = np.nonzero(valid)
-    for f, i, j in zip(frames, ri, rj):
-        contacts.append((
-            frame_offset + int(f), itype,
-            groups.ring_labels[i], groups.ring_labels[j],
-        ))
-    return contacts
+    if len(frames) == 0:
+        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
+
+    abs_frames = frames.astype(np.int32) + frame_offset
+    itypes = np.full(len(frames), itype, dtype=object)
+    
+    lbls = np.array(groups.ring_labels, dtype=object)
+    a1_arr = lbls[ri]
+    a2_arr = lbls[rj]
+
+    return abs_frames, itypes, a1_arr, a2_arr
 
 
 def compute_pi_stacking(
@@ -93,8 +95,8 @@ def compute_pi_stacking(
     geom: dict,
     frame_offset: int,
     ring_pair_mask: np.ndarray,
-) -> list[tuple]:
-    return _compute_aromatics(coords, groups, geom, frame_offset, ring_pair_mask, "ps")
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return _compute_stacking(coords, groups, geom, frame_offset, ring_pair_mask, "ps")
 
 
 def compute_t_stacking(
@@ -103,5 +105,5 @@ def compute_t_stacking(
     geom: dict,
     frame_offset: int,
     ring_pair_mask: np.ndarray,
-) -> list[tuple]:
-    return _compute_aromatics(coords, groups, geom, frame_offset, ring_pair_mask, "ts")
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return _compute_stacking(coords, groups, geom, frame_offset, ring_pair_mask, "ts")

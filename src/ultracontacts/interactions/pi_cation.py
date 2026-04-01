@@ -33,22 +33,22 @@ def precompute_pc_mask(groups: ChemicalGroups) -> np.ndarray:
 
 
 def compute_pi_cation(
-    coords: jnp.ndarray,       # (F, N, 3)
+    coords: jnp.ndarray,         # (F, N, 3) on-device
     groups: ChemicalGroups,
     geom: dict,
     frame_offset: int,
-    pc_mask: np.ndarray,       # (R, Nc) from precompute_pc_mask
-) -> list[tuple]:
+    sele_mask: np.ndarray,        # (R, C) bool
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 
-    dist_cut = float(geom.get("PC_CUTOFF_DIST", 6.0))
-    ang_cut = float(geom.get("PC_CUTOFF_ANG", 60.0))
+    dist_cutoff = float(geom.get("PC_CUTOFF_DIST", 6.0))
+    ang_cutoff = float(geom.get("PC_CUTOFF_ANG", 60.0))
 
-    R = len(groups.ring_indices)
-    Nc = len(groups.cation_indices)
-    if pc_mask.size == 0 or R == 0 or Nc == 0:
-        return []
+    if sele_mask.size == 0 or len(groups.ring_indices) == 0 or len(groups.cation_indices) == 0:
+        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
 
     F = coords.shape[0]
+    R = len(groups.ring_indices)
+    Nc = len(groups.cation_indices)
 
     # Ring geometry
     ring_xyz = coords[:, groups.ring_indices, :].reshape(F, R, 3, 3)  # (F, R, 3, 3)
@@ -59,17 +59,19 @@ def compute_pi_cation(
     # Boolean mask evaluation in a single fused JAX GPU kernel
     bool_mask = np.array(fused_pi_cation_mask(
         ring_xyz, cat_xyz,
-        dist_cut ** 2, 1000.0, ang_cut
+        dist_cutoff ** 2, 1000.0, ang_cutoff
     ))  # (F, R, C)
 
-    valid = bool_mask & pc_mask[None, :, :]
+    valid = bool_mask & sele_mask[None, :, :]
 
-    contacts = []
-    frames, ri, ci = np.nonzero(valid)
-    for f, r, c in zip(frames, ri, ci):
-        contacts.append((
-            frame_offset + int(f), "pc",
-            groups.cation_labels[c],   # cation first (matches getcontacts)
-            groups.ring_labels[r],
-        ))
-    return contacts
+    frames, rin_pos, cat_pos = np.nonzero(valid)
+    if len(frames) == 0:
+        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
+
+    abs_frames = frames.astype(np.int32) + frame_offset
+    itypes = np.full(len(frames), "pc", dtype=object)
+    
+    r_lbls = np.array(groups.ring_labels, dtype=object)[rin_pos]
+    c_lbls = np.array(groups.cation_labels, dtype=object)[cat_pos]
+
+    return abs_frames, itypes, c_lbls, r_lbls

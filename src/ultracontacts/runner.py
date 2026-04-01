@@ -209,19 +209,36 @@ def compute_contacts(
     parquet_writer = [None]  # mutable container for the ParquetWriter
     write_lock = threading.Lock()
 
-    def _process_chunk(chunk_xyz: np.ndarray, frame_offsets: list[int], device) -> list[tuple]:
+    def _process_chunk(chunk_xyz: np.ndarray, frame_offsets: list[int], device) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Run all enabled interaction types on a coordinate chunk."""
         jax_coords = jax.device_put(jnp.array(chunk_xyz), device)
         frame_offset = frame_offsets[0]
-        contacts = []
-        if "sb" in itypes: contacts += compute_salt_bridges(jax_coords, groups, geom, frame_offset, masks["sb"])
-        if "hp" in itypes: contacts += compute_hydrophobics(jax_coords, groups, geom, frame_offset, masks["hp"])
-        if "vdw" in itypes: contacts += compute_vanderwaals(jax_coords, groups, geom, frame_offset, masks["vdw_pair"], masks["vdw_cut"])
-        if "hb" in itypes: contacts += compute_hbonds(jax_coords, groups, geom, frame_offset, masks["hb"])
-        if "ps" in itypes: contacts += compute_pi_stacking(jax_coords, groups, geom, frame_offset, masks["rings"])
-        if "ts" in itypes: contacts += compute_t_stacking(jax_coords, groups, geom, frame_offset, masks["rings"])
-        if "pc" in itypes: contacts += compute_pi_cation(jax_coords, groups, geom, frame_offset, masks["pc"])
-        return contacts
+        
+        f_arrs, it_arrs, a1_arrs, a2_arrs = [], [], [], []
+        def _add(res):
+            if len(res[0]) > 0:
+                f_arrs.append(res[0])
+                it_arrs.append(res[1])
+                a1_arrs.append(res[2])
+                a2_arrs.append(res[3])
+
+        if "sb" in itypes: _add(compute_salt_bridges(jax_coords, groups, geom, frame_offset, masks["sb"]))
+        if "hp" in itypes: _add(compute_hydrophobics(jax_coords, groups, geom, frame_offset, masks["hp"]))
+        if "vdw" in itypes: _add(compute_vanderwaals(jax_coords, groups, geom, frame_offset, masks["vdw_pair"], masks["vdw_cut"]))
+        if "hb" in itypes: _add(compute_hbonds(jax_coords, groups, geom, frame_offset, masks["hb"]))
+        if "ps" in itypes: _add(compute_pi_stacking(jax_coords, groups, geom, frame_offset, masks["rings"]))
+        if "ts" in itypes: _add(compute_t_stacking(jax_coords, groups, geom, frame_offset, masks["rings"]))
+        if "pc" in itypes: _add(compute_pi_cation(jax_coords, groups, geom, frame_offset, masks["pc"]))
+        
+        if not f_arrs:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object)
+            
+        return (
+            np.concatenate(f_arrs),
+            np.concatenate(it_arrs),
+            np.concatenate(a1_arrs),
+            np.concatenate(a2_arrs),
+        )
 
     futures = []
     chunked_frames = [frames_to_process[i:i + chunk_size] for i in range(0, len(frames_to_process), chunk_size)]
@@ -247,7 +264,7 @@ def compute_contacts(
         # Collect and write results as sequentially queued to preserve exact original order
         for fut, first_frame in futures:
             contacts = fut.result()
-            if contacts:
+            if len(contacts[0]) > 0:
                 with write_lock:
                     parquet_writer[0] = write_parquet_chunk(
                         contacts, output, parquet_writer[0], itypes, beg, end, stride

@@ -34,7 +34,7 @@ _SCHEMA = pa.schema([
 
 
 def write_parquet_chunk(
-    contacts: list[tuple],
+    contacts: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
     output_path: str,
     writer,          # pq.ParquetWriter | None
     itypes: list[str],
@@ -45,17 +45,10 @@ def write_parquet_chunk(
     """
     Append a batch of contacts to the Parquet file.
     Creates the writer on first call (writer=None).
-
-    contacts: list of (frame, itype, atom1, atom2)
-    Returns the (possibly newly created) ParquetWriter.
     """
-    if not contacts:
+    frames, it_arr, a1_arr, a2_arr = contacts
+    if len(frames) == 0:
         return writer
-
-    frames = np.array([c[0] for c in contacts], dtype=np.int32)
-    it_arr = [c[1] for c in contacts]
-    a1_arr = [c[2] for c in contacts]
-    a2_arr = [c[3] for c in contacts]
 
     batch = pa.RecordBatch.from_arrays(
         [

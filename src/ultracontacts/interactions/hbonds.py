@@ -62,22 +62,22 @@ def _classify_hbond(d_bb: bool, d_lig: bool, a_bb: bool, a_lig: bool) -> str:
         return "hbss"
     return "hbsb"
 
-
 def compute_hbonds(
     coords: jnp.ndarray,       # (F, N, 3)
     groups: ChemicalGroups,
     geom: dict,
     frame_offset: int,
-    pair_mask: np.ndarray,     # (D, A) from precompute_hbond_mask
-) -> list[tuple]:
+    sele_mask: np.ndarray,          # (D, A) from precompute_hbond_mask
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns (frames_arr, itypes_arr, atom1_arr, atom2_arr).
+    """
 
     dist_cutoff = float(geom.get("HBOND_CUTOFF_DIST", 3.5))
     ang_cutoff = float(geom.get("HBOND_CUTOFF_ANG", 150.0))
 
-    D = len(groups.donor_indices)
-    A = len(groups.acceptor_indices)
-    if pair_mask.size == 0 or D == 0 or A == 0:
-        return []
+    if sele_mask.size == 0 or len(groups.donor_indices) == 0 or len(groups.acceptor_indices) == 0:
+        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
 
     # Gather coordinates
     d_xyz = coords[:, groups.donor_indices, :]     # (F, D, 3)
@@ -89,19 +89,22 @@ def compute_hbonds(
         dist_cutoff**2, ang_cutoff
     ))  # (F, D, A)
     
-    valid = bool_mask & pair_mask[None, :, :]
+    valid = bool_mask & sele_mask[None, :, :]
 
-    contacts = []
     frames, d_pos, a_pos = np.nonzero(valid)
-    for f, di, ai in zip(frames, d_pos, a_pos):
-        itype = _classify_hbond(
-            bool(groups.donor_is_bb[di]),
-            bool(groups.donor_is_ligand[di]),
-            bool(groups.acceptor_is_bb[ai]),
-            bool(groups.acceptor_is_ligand[ai]),
-        )
-        contacts.append((
-            frame_offset + int(f), itype,
-            groups.donor_labels[di], groups.acceptor_labels[ai],
-        ))
-    return contacts
+    if len(frames) == 0:
+        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
+
+    abs_frames = frames.astype(np.int32) + frame_offset
+    
+    d_lbls = np.array(groups.donor_labels, dtype=object)[d_pos]
+    a_lbls = np.array(groups.acceptor_labels, dtype=object)[a_pos]
+    d_lig = np.array(groups.donor_is_ligand, dtype=bool)[d_pos]
+    a_lig = np.array(groups.acceptor_is_ligand, dtype=bool)[a_pos]
+
+    itypes = np.full(len(frames), "hb", dtype=object)
+    itypes[d_lig & ~a_lig] = "hblp"
+    itypes[~d_lig & a_lig] = "hbpl"
+    itypes[d_lig & a_lig]  = "hbll"
+
+    return abs_frames, itypes, d_lbls, a_lbls

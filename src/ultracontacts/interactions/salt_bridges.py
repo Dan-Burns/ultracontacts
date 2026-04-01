@@ -31,14 +31,14 @@ def compute_salt_bridges(
     geom: dict,
     frame_offset: int,
     sele_mask: np.ndarray,         # (Na, Nc) bool — from precompute_sb_mask
-) -> list[tuple]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Returns list of (abs_frame, 'sb'/'sblp'/'sbpl'/'sbll', anion_label, cation_label).
+    Returns (frames_arr, itypes_arr, atom1_arr, atom2_arr).
     """
     cutoff = float(geom.get("SB_CUTOFF_DIST", 4.0))
 
-    if sele_mask.size == 0:
-        return []
+    if sele_mask.size == 0 or len(groups.anion_indices) == 0 or len(groups.cation_indices) == 0:
+        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
 
     Na = len(groups.anion_indices)
     Nc = len(groups.cation_indices)
@@ -53,24 +53,21 @@ def compute_salt_bridges(
 
     valid = bool_mask & sele_mask[None, :, :]
 
-    contacts = []
     frames, an_pos, cat_pos = np.nonzero(valid)
-    for f, ai, ci in zip(frames, an_pos, cat_pos):
-        abs_frame = frame_offset + int(f)
-        a_lbl = groups.anion_labels[ai]
-        c_lbl = groups.cation_labels[ci]
-        a_lig = bool(groups.anion_is_ligand[ai])
-        c_lig = bool(groups.cation_is_ligand[ci])
+    if len(frames) == 0:
+        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
 
-        if a_lig and c_lig:
-            itype = "sbll"
-        elif a_lig:
-            itype = "sblp"
-        elif c_lig:
-            itype = "sbpl"
-        else:
-            itype = "sb"
+    abs_frames = frames.astype(np.int32) + frame_offset
+    
+    a_lbls = np.array(groups.anion_labels, dtype=object)[an_pos]
+    c_lbls = np.array(groups.cation_labels, dtype=object)[cat_pos]
+    
+    a_lig = np.array(groups.anion_is_ligand, dtype=bool)[an_pos]
+    c_lig = np.array(groups.cation_is_ligand, dtype=bool)[cat_pos]
 
-        contacts.append((abs_frame, itype, a_lbl, c_lbl))
+    itypes = np.full(len(frames), "sb", dtype=object)
+    itypes[a_lig & ~c_lig] = "sblp"
+    itypes[~a_lig & c_lig] = "sbpl"
+    itypes[a_lig & c_lig]  = "sbll"
 
-    return contacts
+    return abs_frames, itypes, a_lbls, c_lbls
