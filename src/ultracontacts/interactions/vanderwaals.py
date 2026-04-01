@@ -1,125 +1,72 @@
 """
-vanderwaals.py — GPU-vectorized van der Waals contact detection.
+vanderwaals.py — GPU-fused van der Waals contact detection via CuPy.
 
-Criterion: distance(atom1, atom2) < vdw_radius1 + vdw_radius2 + VDW_EPSILON (default 0.5 Å),
-           atoms must be from different residues separated by >= VDW_RES_DIFF (default 2).
-Non-hydrogen atoms only.
-
-For large selections this module uses atom-pair chunking to stay within GPU memory.
+Criterion: distance(a1, a2) < vdw_radius1 + vdw_radius2 + VDW_EPSILON.
+Per-pair cutoffs computed inline in the CUDA kernel from radius arrays.
+No sub-blocking needed — the kernel never materializes an N² tensor.
 """
 
 from __future__ import annotations
 import numpy as np
-import jax
-import jax.numpy as jnp
+import cupy as cp
 
 from ..topology import ChemicalGroups, build_dual_sele_mask, build_residue_diff_mask
-from ..geometry import fused_dist_mask
-
-# Maximum atoms per batch side to cap (V1*V2*F) tensor memory (~2 GB budget)
-_MAX_ATOMS_PER_SIDE = 2000
+from ..kernels import vdw_contacts_gpu
 
 
 def precompute_vdw_mask(groups: ChemicalGroups, res_diff: int,
                          sele1_eq_sele2: bool) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Returns:
-        pair_mask: (V1, V2) bool — statically valid pairs
-        cutoff_mat: (V1, V2) float32 — per-pair distance cutoff = r1 + r2 + epsilon
-    """
     V1, V2 = len(groups.vdw_indices1), len(groups.vdw_indices2)
     if V1 == 0 or V2 == 0:
-        return np.empty((0, 0), dtype=bool), np.empty((0, 0), dtype=np.float32)
+        return np.empty((0, 0), dtype=bool), np.empty(0, dtype=np.float32)
 
-    sele_mask = build_dual_sele_mask(
-        groups.vdw_is_ligand1 | True,   # all v1 atoms are in sele1 by construction
-        np.zeros(V1, dtype=bool),
-        np.zeros(V2, dtype=bool),
-        groups.vdw_is_ligand2 | True,
-    )
-    # Actually for vdw, sele1 and sele2 are already the correct subsets —
-    # just filter by residue diff.
     sele_mask = np.ones((V1, V2), dtype=bool)
-
     res_mask = build_residue_diff_mask(
         groups.vdw_chain1, groups.vdw_resid1,
         groups.vdw_chain2, groups.vdw_resid2,
         min_diff=res_diff,
     )
-
-    # Exclude disulfide CYS pairs handled in hydrophobics
     pair_mask = sele_mask & res_mask
-
     if sele1_eq_sele2:
-        # avoid duplicate (i,j) and (j,i)
-        # When selections are identical, V1==V2 and indices match
         pair_mask &= np.triu(np.ones_like(pair_mask), k=1)
 
-    # Per-pair VdW cutoffs
-    cutoff_mat = (groups.vdw_radii1[:, None] +
-                  groups.vdw_radii2[None, :]).astype(np.float32)  # (V1, V2)
+    return pair_mask, groups.vdw_radii1  # radii2 accessed from groups directly
 
-    return pair_mask, cutoff_mat
+
+def precompute_vdw_gpu(groups: ChemicalGroups, pair_mask: np.ndarray) -> dict:
+    return {
+        "idx1": cp.asarray(groups.vdw_indices1),
+        "idx2": cp.asarray(groups.vdw_indices2),
+        "mask": cp.asarray(pair_mask.ravel()),
+        "radii1": cp.asarray(groups.vdw_radii1),
+        "radii2": cp.asarray(groups.vdw_radii2),
+        "lbls1": np.array(groups.vdw_labels1, dtype=object),
+        "lbls2": np.array(groups.vdw_labels2, dtype=object),
+    }
 
 
 def compute_vanderwaals(
-    coords: jnp.ndarray,
-    groups: ChemicalGroups,
+    coords_gpu: cp.ndarray,
+    gpu_data: dict,
     geom: dict,
-    frame_offset: int,
-    pair_mask: np.ndarray,     # (V1, V2)
-    cutoff_mat: np.ndarray,    # (V1, V2) — per-pair hard cutoff in Å
+    abs_frame: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     epsilon = float(geom.get("VDW_EPSILON", 0.5))
 
-    if pair_mask.size == 0 or len(groups.vdw_indices1) == 0 or len(groups.vdw_indices2) == 0:
-        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
+    if len(gpu_data["idx1"]) == 0 or len(gpu_data["idx2"]) == 0:
+        return (np.empty(0, np.int32), np.empty(0, object), np.empty(0, object), np.empty(0, object))
 
-    V1, V2 = pair_mask.shape
-    F = coords.shape[0]
-    
-    f_arrs, a1_arrs, a2_arrs = [], [], []
+    i_hits, j_hits = vdw_contacts_gpu(
+        coords_gpu, gpu_data["idx1"], gpu_data["idx2"],
+        gpu_data["mask"], gpu_data["radii1"], gpu_data["radii2"],
+        epsilon,
+    )
+    if len(i_hits) == 0:
+        return (np.empty(0, np.int32), np.empty(0, object), np.empty(0, object), np.empty(0, object))
 
-    # Determine chunk sizes to stay within GPU memory
-    chunk1 = min(V1, _MAX_ATOMS_PER_SIDE)
-    chunk2 = min(V2, _MAX_ATOMS_PER_SIDE)
+    frames = np.full(len(i_hits), abs_frame, dtype=np.int32)
+    itypes = np.full(len(i_hits), "vdw", dtype=object)
+    a1 = gpu_data["lbls1"][i_hits]
+    a2 = gpu_data["lbls2"][j_hits]
 
-    for i0 in range(0, V1, chunk1):
-        i1 = min(i0 + chunk1, V1)
-        idx1_chunk = groups.vdw_indices1[i0:i1]
-        mask_chunk = pair_mask[i0:i1, :]          # (c1, V2)
-        cut_chunk = cutoff_mat[i0:i1, :] + epsilon  # (c1, V2)
-        xyz1 = coords[:, idx1_chunk, :]             # (F, c1, 3)
-
-        for j0 in range(0, V2, chunk2):
-            j1 = min(j0 + chunk2, V2)
-            sub_mask = mask_chunk[:, j0:j1]         # (c1, c2)
-            if not sub_mask.any():
-                continue
-
-            idx2_sub = groups.vdw_indices2[j0:j1]
-            xyz2 = coords[:, idx2_sub, :]            # (F, c2, 3)
-            sub_cut = cut_chunk[:, j0:j1]            # (c1, c2)
-            
-            bool_mask = np.array(fused_dist_mask(xyz1, xyz2, jnp.array(sub_cut ** 2))) # (F, c1, c2)
-
-            valid = bool_mask & sub_mask[None, :, :]
-
-            ff, ii, jj = np.nonzero(valid)
-            if len(ff) > 0:
-                f_arrs.append(ff.astype(np.int32) + frame_offset)
-                
-                gi_idx = i0 + ii
-                gj_idx = j0 + jj
-                a1_arrs.append(np.array(groups.vdw_labels1, dtype=object)[gi_idx])
-                a2_arrs.append(np.array(groups.vdw_labels2, dtype=object)[gj_idx])
-
-    if not f_arrs:
-        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
-    
-    f_arr = np.concatenate(f_arrs)
-    a1_arr = np.concatenate(a1_arrs)
-    a2_arr = np.concatenate(a2_arrs)
-    it_arr = np.full(len(f_arr), "vdw", dtype=object)
-
-    return f_arr, it_arr, a1_arr, a2_arr
+    return frames, itypes, a1, a2

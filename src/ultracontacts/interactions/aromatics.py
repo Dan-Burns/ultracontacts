@@ -1,38 +1,22 @@
 """
-aromatics.py — GPU-vectorized pi-stacking and T-stacking detection.
+aromatics.py — GPU-fused pi-stacking and T-stacking detection via CuPy.
 
-Both interaction types (ps, ts) share the same geometric framework:
-centroid distances, normal vectors, and plane-alignment angles. The only
-difference is the target angle between normals.
-
-Pi-stacking  (ps): planes nearly parallel  → normal-normal angle ≈ 0° (or 180°)
-T-stacking   (ts): planes nearly perpendicular → normal-normal angle ≈ 90°
-
-Criteria (getcontacts defaults):
-  ps: centroid dist < 7.0 Å, plane angle < 30°, psi < 45°
-  ts: centroid dist < 5.0 Å, |plane angle - 90| < 30°, psi < 45°
+Pi-stacking  (ps): planes nearly parallel  → normal angle ≈ 0°
+T-stacking   (ts): planes nearly perpendicular → normal angle ≈ 90°
 """
 
 from __future__ import annotations
 import numpy as np
-import jax.numpy as jnp
+import cupy as cp
 
 from ..topology import ChemicalGroups, build_dual_sele_mask
-from ..geometry import fused_pi_stacking_mask, fused_t_stacking_mask
+from ..kernels import ring_stacking_gpu
 
 
-def precompute_ring_pair_mask(
-    groups: ChemicalGroups,
-    sele1_eq_sele2: bool,
-) -> np.ndarray:
-    """
-    Returns (R, R) bool — valid ring-ring pairs for aromatic interactions.
-    Excludes self-pairs; uses upper triangle when sele1==sele2 to avoid duplicates.
-    """
+def precompute_ring_pair_mask(groups: ChemicalGroups, sele1_eq_sele2: bool) -> np.ndarray:
     R = len(groups.ring_indices)
     if R == 0:
         return np.empty((0, 0), dtype=bool)
-
     sele_mask = build_dual_sele_mask(
         groups.ring_in_sele1, groups.ring_in_sele2,
         groups.ring_in_sele1, groups.ring_in_sele2,
@@ -43,67 +27,55 @@ def precompute_ring_pair_mask(
     return sele_mask
 
 
-def _compute_stacking(
-    coords: jnp.ndarray,
-    groups: ChemicalGroups,
-    geom: dict,
-    frame_offset: int,
-    ring_pair_mask: np.ndarray,      # (R, R) bool
-    itype: str,                      # "ps" or "ts"
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def precompute_ring_gpu(groups: ChemicalGroups, mask: np.ndarray) -> dict:
+    return {
+        "ring_atoms": cp.asarray(groups.ring_indices.ravel().astype(np.int32)),
+        "mask": cp.asarray(mask.ravel()),
+        "R": len(groups.ring_indices),
+        "lbls": np.array(groups.ring_labels, dtype=object),
+    }
 
-    # Parse appropriate cutoffs
+
+def _compute_stacking(
+    coords_gpu: cp.ndarray,
+    gpu_data: dict,
+    geom: dict,
+    abs_frame: int,
+    itype: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if itype == "ps":
         dist_cut = float(geom.get("PS_CUTOFF_DIST", 7.0))
         ang_cut = float(geom.get("PS_CUTOFF_ANG", 30.0))
         psi_cut = float(geom.get("PS_PSI_ANG", 45.0))
-    else:  # ts
+    else:
         dist_cut = float(geom.get("TS_CUTOFF_DIST", 5.0))
         ang_cut = float(geom.get("TS_CUTOFF_ANG", 30.0))
         psi_cut = float(geom.get("TS_PSI_ANG", 45.0))
 
-    if ring_pair_mask.size == 0 or len(groups.ring_indices) == 0:
-        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
+    R = gpu_data["R"]
+    if R == 0:
+        return (np.empty(0, np.int32), np.empty(0, object), np.empty(0, object), np.empty(0, object))
 
-    # Gather ring atom coords: (F, R, 3, 3)
-    ring_xyz = coords[:, groups.ring_indices, :]    # (F, R*3, 3)
-    F = coords.shape[0]
-    ring_xyz = ring_xyz.reshape(F, R, 3, 3)         # (F, R, 3, 3)
+    ri_hits, rj_hits = ring_stacking_gpu(
+        coords_gpu, gpu_data["ring_atoms"], gpu_data["mask"],
+        dist_cut ** 2, ang_cut, psi_cut,
+        is_t_stacking=(itype == "ts"),
+        R=R,
+    )
+    if len(ri_hits) == 0:
+        return (np.empty(0, np.int32), np.empty(0, object), np.empty(0, object), np.empty(0, object))
 
-    if itype == "ps":
-        bool_mask = np.array(fused_pi_stacking_mask(ring_xyz, dist_cut ** 2, ang_cut, psi_cut))
-    else:
-        bool_mask = np.array(fused_t_stacking_mask(ring_xyz, dist_cut ** 2, ang_cut, psi_cut))
+    frames = np.full(len(ri_hits), abs_frame, dtype=np.int32)
+    itypes = np.full(len(ri_hits), itype, dtype=object)
+    a1 = gpu_data["lbls"][ri_hits]
+    a2 = gpu_data["lbls"][rj_hits]
 
-    frames, ri, rj = np.nonzero(valid)
-    if len(frames) == 0:
-        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
-
-    abs_frames = frames.astype(np.int32) + frame_offset
-    itypes = np.full(len(frames), itype, dtype=object)
-    
-    lbls = np.array(groups.ring_labels, dtype=object)
-    a1_arr = lbls[ri]
-    a2_arr = lbls[rj]
-
-    return abs_frames, itypes, a1_arr, a2_arr
+    return frames, itypes, a1, a2
 
 
-def compute_pi_stacking(
-    coords: jnp.ndarray,
-    groups: ChemicalGroups,
-    geom: dict,
-    frame_offset: int,
-    ring_pair_mask: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    return _compute_stacking(coords, groups, geom, frame_offset, ring_pair_mask, "ps")
+def compute_pi_stacking(coords_gpu, gpu_data, geom, abs_frame):
+    return _compute_stacking(coords_gpu, gpu_data, geom, abs_frame, "ps")
 
 
-def compute_t_stacking(
-    coords: jnp.ndarray,
-    groups: ChemicalGroups,
-    geom: dict,
-    frame_offset: int,
-    ring_pair_mask: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    return _compute_stacking(coords, groups, geom, frame_offset, ring_pair_mask, "ts")
+def compute_t_stacking(coords_gpu, gpu_data, geom, abs_frame):
+    return _compute_stacking(coords_gpu, gpu_data, geom, abs_frame, "ts")

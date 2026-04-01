@@ -1,20 +1,19 @@
 """
-hydrophobics.py — GPU-vectorized hydrophobic contact detection.
+hydrophobics.py — GPU-fused hydrophobic contact detection via CuPy.
 
 Criterion: two hydrophobic C/S atoms within HP_CUTOFF_DIST (default 4.0 Å),
-           in different residues, not in the same-chain sequential residues (res_diff filter).
+           in different residues.
 """
 
 from __future__ import annotations
 import numpy as np
-import jax.numpy as jnp
+import cupy as cp
 
 from ..topology import ChemicalGroups, build_dual_sele_mask, build_residue_diff_mask
-from ..geometry import fused_dist_mask
+from ..kernels import dist_contacts_gpu
 
 
 def precompute_hp_mask(groups: ChemicalGroups, res_diff: int) -> np.ndarray:
-    """Return (Hp, Hp) bool — valid hydrophobic pairs."""
     Hp = len(groups.hp_indices)
     if Hp == 0:
         return np.empty((0, 0), dtype=bool)
@@ -27,43 +26,40 @@ def precompute_hp_mask(groups: ChemicalGroups, res_diff: int) -> np.ndarray:
         groups.hp_chain, groups.hp_resid,
         min_diff=res_diff,
     )
-    # Exclude self-pairs
     np.fill_diagonal(res_mask, False)
-    # Only upper triangle to avoid double-counting
     upper = np.triu(np.ones((Hp, Hp), dtype=bool), k=1)
     return sele_mask & res_mask & upper
 
 
+def precompute_hp_gpu(groups: ChemicalGroups, mask: np.ndarray) -> dict:
+    return {
+        "idx": cp.asarray(groups.hp_indices),
+        "mask": cp.asarray(mask.ravel()),
+        "lbls": np.array(groups.hp_labels, dtype=object),
+    }
+
+
 def compute_hydrophobics(
-    coords: jnp.ndarray,       # (F, N, 3) on-device
-    groups: ChemicalGroups,
+    coords_gpu: cp.ndarray,
+    gpu_data: dict,
     geom: dict,
-    frame_offset: int,
-    sele_mask: np.ndarray,    # (Hp, Hp) from precompute_hp_mask
+    abs_frame: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     cutoff = float(geom.get("HP_CUTOFF_DIST", 4.0))
-    max_dist_sq = cutoff * cutoff
 
-    if sele_mask.size == 0 or len(groups.hp_indices) == 0:
-        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
+    if len(gpu_data["idx"]) == 0:
+        return (np.empty(0, np.int32), np.empty(0, object), np.empty(0, object), np.empty(0, object))
 
-    hp_xyz = coords[:, groups.hp_indices, :]   # (F, Hp, 3)
+    i_hits, j_hits = dist_contacts_gpu(
+        coords_gpu, gpu_data["idx"], gpu_data["idx"],
+        gpu_data["mask"], cutoff ** 2,
+    )
+    if len(i_hits) == 0:
+        return (np.empty(0, np.int32), np.empty(0, object), np.empty(0, object), np.empty(0, object))
 
-    # Boolean mask natively from GPU
-    bool_mask = np.array(fused_dist_mask(hp_xyz, hp_xyz, max_dist_sq)) # (F, Hp, Hp)
+    frames = np.full(len(i_hits), abs_frame, dtype=np.int32)
+    itypes = np.full(len(i_hits), "hp", dtype=object)
+    a1 = gpu_data["lbls"][i_hits]
+    a2 = gpu_data["lbls"][j_hits]
 
-    # Apply topology masks
-    valid = bool_mask & sele_mask[None, :, :]
-
-    frames, i_pos, j_pos = np.nonzero(valid)
-    if len(frames) == 0:
-        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
-
-    abs_frames = frames.astype(np.int32) + frame_offset
-    itypes = np.full(len(frames), "hp", dtype=object)
-    
-    lbls = np.array(groups.hp_labels, dtype=object)
-    a1_arr = lbls[i_pos]
-    a2_arr = lbls[j_pos]
-
-    return abs_frames, itypes, a1_arr, a2_arr
+    return frames, itypes, a1, a2

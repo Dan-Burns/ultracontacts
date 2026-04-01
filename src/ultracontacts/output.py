@@ -27,9 +27,9 @@ import pyarrow.parquet as pq
 
 _SCHEMA = pa.schema([
     pa.field("frame", pa.int32()),
-    pa.field("itype", pa.dictionary(pa.int8(), pa.string())),
-    pa.field("atom1", pa.dictionary(pa.int16(), pa.string())),
-    pa.field("atom2", pa.dictionary(pa.int16(), pa.string())),
+    pa.field("itype", pa.string()),
+    pa.field("atom1", pa.string()),
+    pa.field("atom2", pa.string()),
 ])
 
 
@@ -53,18 +53,9 @@ def write_parquet_chunk(
     batch = pa.RecordBatch.from_arrays(
         [
             pa.array(frames, type=pa.int32()),
-            pa.DictionaryArray.from_arrays(
-                pa.array(pd.Categorical(it_arr).codes.astype(np.int8)),
-                pa.array(pd.Categorical(it_arr).categories.tolist()),
-            ),
-            pa.DictionaryArray.from_arrays(
-                pa.array(pd.Categorical(a1_arr).codes.astype(np.int16)),
-                pa.array(pd.Categorical(a1_arr).categories.tolist()),
-            ),
-            pa.DictionaryArray.from_arrays(
-                pa.array(pd.Categorical(a2_arr).codes.astype(np.int16)),
-                pa.array(pd.Categorical(a2_arr).categories.tolist()),
-            ),
+            pa.array(it_arr, type=pa.string()),
+            pa.array(a1_arr, type=pa.string()),
+            pa.array(a2_arr, type=pa.string()),
         ],
         schema=_SCHEMA,
     )

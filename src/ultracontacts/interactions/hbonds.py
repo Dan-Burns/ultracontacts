@@ -1,34 +1,21 @@
 """
-hbonds.py — GPU-vectorized hydrogen bond detection.
-
-Requires explicit H in topology.
+hbonds.py — GPU-fused hydrogen bond detection via CuPy.
 
 Criteria:
-  - D···A distance < HBOND_CUTOFF_DIST  (default 3.5 Å)
-  - D-H···A angle  > HBOND_CUTOFF_ANG   (default 150°; getcontacts uses 70° deviation
-                                          from 180°, so min angle = 180-70 = 110°.
-                                          We default to 150° for stricter detection.)
-  - |resid(D) - resid(A)| >= HBOND_RES_DIFF when same chain  (default 1)
-
-Classifications match getcontacts:
-  hbbb, hbss, hbsb, hbls, hblb, hbll
+  - D···A distance < HBOND_CUTOFF_DIST (default 3.5 Å)
+  - D-H···A angle  > HBOND_CUTOFF_ANG  (default 150°)
+  - |resid(D) - resid(A)| >= HBOND_RES_DIFF
 """
 
 from __future__ import annotations
 import numpy as np
-import jax.numpy as jnp
+import cupy as cp
 
 from ..topology import ChemicalGroups, build_dual_sele_mask, build_residue_diff_mask
-from ..geometry import fused_hbond_mask
+from ..kernels import hbond_contacts_gpu
 
 
-def precompute_hbond_mask(
-    groups: ChemicalGroups,
-    res_diff: int,
-) -> np.ndarray:
-    """
-    Returns (D, A) bool — statically valid donor-acceptor pairs.
-    """
+def precompute_hbond_mask(groups: ChemicalGroups, res_diff: int) -> np.ndarray:
     D = len(groups.donor_indices)
     A = len(groups.acceptor_indices)
     if D == 0 or A == 0:
@@ -45,66 +32,50 @@ def precompute_hbond_mask(
         bb_a=groups.donor_is_bb,
         bb_b=groups.acceptor_is_bb,
     )
-
     return sele_mask & res_mask
 
 
-def _classify_hbond(d_bb: bool, d_lig: bool, a_bb: bool, a_lig: bool) -> str:
-    if d_lig and a_lig:
-        return "hbll"
-    if d_lig:
-        return "hblb" if a_bb else "hbls"
-    if a_lig:
-        return "hblb" if d_bb else "hbls"
-    if d_bb and a_bb:
-        return "hbbb"
-    if not d_bb and not a_bb:
-        return "hbss"
-    return "hbsb"
+def precompute_hb_gpu(groups: ChemicalGroups, mask: np.ndarray) -> dict:
+    return {
+        "donor_idx": cp.asarray(groups.donor_indices),
+        "h_idx": cp.asarray(groups.hydrogen_indices),
+        "acc_idx": cp.asarray(groups.acceptor_indices),
+        "mask": cp.asarray(mask.ravel()),
+        "d_lbls": np.array(groups.donor_labels, dtype=object),
+        "a_lbls": np.array(groups.acceptor_labels, dtype=object),
+        "d_lig": np.array(groups.donor_is_ligand, dtype=bool),
+        "a_lig": np.array(groups.acceptor_is_ligand, dtype=bool),
+    }
+
 
 def compute_hbonds(
-    coords: jnp.ndarray,       # (F, N, 3)
-    groups: ChemicalGroups,
+    coords_gpu: cp.ndarray,
+    gpu_data: dict,
     geom: dict,
-    frame_offset: int,
-    sele_mask: np.ndarray,          # (D, A) from precompute_hbond_mask
+    abs_frame: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Returns (frames_arr, itypes_arr, atom1_arr, atom2_arr).
-    """
-
     dist_cutoff = float(geom.get("HBOND_CUTOFF_DIST", 3.5))
     ang_cutoff = float(geom.get("HBOND_CUTOFF_ANG", 150.0))
 
-    if sele_mask.size == 0 or len(groups.donor_indices) == 0 or len(groups.acceptor_indices) == 0:
-        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
+    if len(gpu_data["donor_idx"]) == 0 or len(gpu_data["acc_idx"]) == 0:
+        return (np.empty(0, np.int32), np.empty(0, object), np.empty(0, object), np.empty(0, object))
 
-    # Gather coordinates
-    d_xyz = coords[:, groups.donor_indices, :]     # (F, D, 3)
-    h_xyz = coords[:, groups.hydrogen_indices, :]  # (F, D, 3)
-    a_xyz = coords[:, groups.acceptor_indices, :]  # (F, A, 3)
+    d_hits, a_hits = hbond_contacts_gpu(
+        coords_gpu, gpu_data["donor_idx"], gpu_data["h_idx"], gpu_data["acc_idx"],
+        gpu_data["mask"], dist_cutoff ** 2, ang_cutoff,
+    )
+    if len(d_hits) == 0:
+        return (np.empty(0, np.int32), np.empty(0, object), np.empty(0, object), np.empty(0, object))
 
-    bool_mask = np.array(fused_hbond_mask(
-        d_xyz, h_xyz, a_xyz,
-        dist_cutoff**2, ang_cutoff
-    ))  # (F, D, A)
-    
-    valid = bool_mask & sele_mask[None, :, :]
+    frames = np.full(len(d_hits), abs_frame, dtype=np.int32)
+    d_lbls = gpu_data["d_lbls"][d_hits]
+    a_lbls = gpu_data["a_lbls"][a_hits]
 
-    frames, d_pos, a_pos = np.nonzero(valid)
-    if len(frames) == 0:
-        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=object), np.empty(0, dtype=object), np.empty(0, dtype=object))
-
-    abs_frames = frames.astype(np.int32) + frame_offset
-    
-    d_lbls = np.array(groups.donor_labels, dtype=object)[d_pos]
-    a_lbls = np.array(groups.acceptor_labels, dtype=object)[a_pos]
-    d_lig = np.array(groups.donor_is_ligand, dtype=bool)[d_pos]
-    a_lig = np.array(groups.acceptor_is_ligand, dtype=bool)[a_pos]
-
-    itypes = np.full(len(frames), "hb", dtype=object)
+    d_lig = gpu_data["d_lig"][d_hits]
+    a_lig = gpu_data["a_lig"][a_hits]
+    itypes = np.full(len(d_hits), "hb", dtype=object)
     itypes[d_lig & ~a_lig] = "hblp"
     itypes[~d_lig & a_lig] = "hbpl"
-    itypes[d_lig & a_lig]  = "hbll"
+    itypes[d_lig & a_lig] = "hbll"
 
-    return abs_frames, itypes, d_lbls, a_lbls
+    return frames, itypes, d_lbls, a_lbls
