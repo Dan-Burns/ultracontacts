@@ -1,0 +1,6 @@
+jax
+jaxlib
+mdanalysis>=2.0
+numpy
+pyarrow
+pandas

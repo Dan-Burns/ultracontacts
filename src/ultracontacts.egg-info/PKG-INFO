@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: ultracontacts
+Version: 0.1.0
+Summary: GPU-accelerated, chemical-group-aware molecular contact analysis
+Requires-Python: >=3.10
+Requires-Dist: jax
+Requires-Dist: jaxlib
+Requires-Dist: mdanalysis>=2.0
+Requires-Dist: numpy
+Requires-Dist: pyarrow
+Requires-Dist: pandas

@@ -1,0 +1,2 @@
+[console_scripts]
+ultracontacts = ultracontacts.cli:main
