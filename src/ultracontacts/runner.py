@@ -162,6 +162,23 @@ def compute_contacts(
     # ---- Pre-compute static masks ----
     masks = _precompute_masks(groups, geom, sele1_eq_sele2, itypes)
 
+    # ---- Auto-tune Chunk Size ----
+    max_pairs = 1
+    if "sb" in itypes: max_pairs = max(max_pairs, len(groups.anion_indices) * len(groups.cation_indices))
+    if "hp" in itypes: max_pairs = max(max_pairs, len(groups.hp_indices) ** 2)
+    if "hb" in itypes: max_pairs = max(max_pairs, len(groups.donor_indices) * len(groups.acceptor_indices))
+    if "ps" in itypes or "ts" in itypes: max_pairs = max(max_pairs, len(groups.ring_indices) ** 2)
+    if "pc" in itypes: max_pairs = max(max_pairs, len(groups.ring_indices) * len(groups.cation_indices))
+    # VdW is internally atom-chunked (max 2000x2000 = 4M elements per block), so we cap its contribution
+    if "vdw" in itypes: max_pairs = max(max_pairs, min(len(groups.vdw_indices1) * len(groups.vdw_indices2), 4_000_000))
+
+    # XLA limit is ~2GB array size per tensor. We limit combinations per chunk to 100M floats (~400 MB).
+    safe_chunk_size = max(1, 100_000_000 // max_pairs)
+    if chunk_size > safe_chunk_size:
+        print(f"[ultracontacts] Dense topology detected (Max pairwise density: {max_pairs:,} pairs/frame).")
+        print(f"[ultracontacts] Auto-tuning chunk_size from {chunk_size} -> {safe_chunk_size} GPU batch to prevent XLA OOM limits.")
+        chunk_size = safe_chunk_size
+
     # ---- Frame range ----
     n_frames_total = len(u.trajectory) if trajectory else 1
     beg = max(0, beg)
