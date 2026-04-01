@@ -132,7 +132,7 @@ def compute_contacts(
             bonds = parse_openmm_bonds(openmm_system, max_atoms=len(u.atoms))
             if len(bonds) > 0:
                 u.add_TopologyAttr('bonds', bonds)
-                print(f"[ultracontacts] Assigned {len(bonds)} bounds from XML")
+                print(f"[ultracontacts] Assigned {len(bonds)} bonds from XML")
             else:
                 print("[ultracontacts] Warning: XML parsed but 0 bonds found")
         except Exception as e:
