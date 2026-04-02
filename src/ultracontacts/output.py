@@ -1,23 +1,23 @@
 """
-output.py — Write contacts to Parquet (frame-by-frame) or TSV (frequencies).
+output.py — Write contacts to Parquet and compute contact frequencies.
 
 Parquet schema:
     frame  : int32
-    itype  : dictionary<int8, string>   (category — very compressed)
-    atom1  : dictionary<int16, string>  (category — repeated labels deduplicated)
-    atom2  : dictionary<int16, string>
+    itype  : string
+    atom1  : string   "chain:resname:resid:name"
+    atom2  : string   "chain:resname:resid:name"
 
-Contact frequency TSV:
+Frequency TSV output:
     itype  res1  res2  frequency
 where res1/res2 = "chain:resname:resid"
 """
 
 from __future__ import annotations
 import os
+from collections import defaultdict
 from typing import Optional
 
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -42,10 +42,7 @@ def write_parquet_chunk(
     end: int,
     stride: int,
 ) -> pq.ParquetWriter:
-    """
-    Append a batch of contacts to the Parquet file.
-    Creates the writer on first call (writer=None).
-    """
+    """Append a batch of contacts to the Parquet file."""
     frames, it_arr, a1_arr, a2_arr = contacts
     if len(frames) == 0:
         return writer
@@ -72,7 +69,6 @@ def finalize_parquet(writer, output_path: str):
     if writer is not None:
         writer.close()
         return
-    # Write empty file
     empty = pa.table(
         {"frame": pa.array([], type=pa.int32()),
          "itype": pa.array([], type=pa.string()),
@@ -86,64 +82,116 @@ def finalize_parquet(writer, output_path: str):
 # Contact frequency computation
 # ---------------------------------------------------------------------------
 
+def _atom_to_res(atom: str) -> str:
+    """'A:ALA:1:CA'  →  'A:ALA:1'"""
+    idx = atom.rfind(":")
+    return atom[:idx] if idx != -1 else atom
+
+
 def compute_frequencies(
     parquet_path: str,
     output_tsv: Optional[str] = None,
     itype_filter: Optional[list[str]] = None,
-) -> pd.DataFrame:
+) -> list[tuple[str, str, str, float, int]]:
     """
     Compute residue-level contact frequencies from a contacts Parquet file.
 
-    Returns a DataFrame with columns: itype, res1, res2, frequency, count.
-    If output_tsv is given, also writes a tab-delimited text file.
+    Uses a streaming row-group scan — memory stays flat regardless of file size.
+    Per-frame residue deduplication mirrors getcontacts' res_contacts_xl logic:
+    multiple atom-level contacts between the same residue pair within one frame
+    count as a single contact.
 
-    res1/res2 format: "chain:resname:resid"  (atom name stripped)
+    Parameters
+    ----------
+    parquet_path : str
+        Path to the contacts .parquet file produced by ultracontacts.
+    output_tsv : str | None
+        If given, write tab-separated frequencies to this path.
+    itype_filter : list[str] | None
+        If given, only include these interaction types.
+
+    Returns
+    -------
+    List of (itype, res1, res2, frequency, count) sorted by itype, frequency desc.
     """
-    df = pd.read_parquet(parquet_path)
+    itype_set = set(itype_filter) if itype_filter else None
 
-    if itype_filter:
-        df = df[df["itype"].isin(itype_filter)]
+    pf = pq.ParquetFile(parquet_path)
+    total_frames = 0
 
-    if df.empty:
-        freq_df = pd.DataFrame(columns=["itype", "res1", "res2", "count", "frequency"])
+    # counts[(itype, res1, res2)] = number of frames in which this pair contacts
+    counts: dict[tuple[str, str, str], int] = defaultdict(int)
+
+    for batch in pf.iter_batches(columns=["frame", "itype", "atom1", "atom2"]):
+        frames_col = batch.column("frame").to_pylist()
+        itype_col  = batch.column("itype").to_pylist()
+        atom1_col  = batch.column("atom1").to_pylist()
+        atom2_col  = batch.column("atom2").to_pylist()
+
+        # Group rows by frame within this batch
+        # Use a per-frame set to deduplicate at residue level
+        frame_pairs: dict[int, dict[str, set[tuple[str, str]]]] = defaultdict(lambda: defaultdict(set))
+
+        for frame, itype, atom1, atom2 in zip(frames_col, itype_col, atom1_col, atom2_col):
+            if itype_set and itype not in itype_set:
+                continue
+            res1 = _atom_to_res(atom1)
+            res2 = _atom_to_res(atom2)
+            # canonical order
+            if res2 < res1:
+                res1, res2 = res2, res1
+            frame_pairs[frame][itype].add((res1, res2))
+
+        # Accumulate into counts; track max frame for total_frames
+        for frame, itype_dict in frame_pairs.items():
+            if frame + 1 > total_frames:
+                total_frames = frame + 1
+            for itype, pairs in itype_dict.items():
+                for res1, res2 in pairs:
+                    counts[(itype, res1, res2)] += 1
+
+    if total_frames == 0 or not counts:
+        rows = []
     else:
-        total_frames = df["frame"].nunique()
-
-        # Strip atom name to get residue label
-        df["res1"] = df["atom1"].str.rsplit(":", n=1).str[0]
-        df["res2"] = df["atom2"].str.rsplit(":", n=1).str[0]
-
-        # Count unique contacts per (frame, itype, res1, res2) to avoid
-        # double-counting same residue pair via different atoms
-        dedup = df.drop_duplicates(subset=["frame", "itype", "res1", "res2"])
-
-        freq_df = (
-            dedup.groupby(["itype", "res1", "res2"])
-            .size()
-            .reset_index(name="count")
-        )
-        freq_df["frequency"] = freq_df["count"] / total_frames
-        freq_df = freq_df.sort_values(
-            ["itype", "frequency"], ascending=[True, False]
-        ).reset_index(drop=True)
+        rows = [
+            (itype, res1, res2, count / total_frames, count)
+            for (itype, res1, res2), count in counts.items()
+        ]
+        rows.sort(key=lambda r: (r[0], -r[3]))  # itype asc, frequency desc
 
     if output_tsv:
-        freq_df.to_csv(output_tsv, sep="\t", index=False,
-                       columns=["itype", "res1", "res2", "frequency"])
-        print(f"[ultracontacts] Frequencies written to {output_tsv}")
+        _write_frequency_tsv(rows, output_tsv, total_frames, itype_filter)
 
-    return freq_df
+    return rows
+
+
+def _write_frequency_tsv(
+    rows: list[tuple],
+    output_tsv: str,
+    total_frames: int,
+    itype_filter: Optional[list[str]],
+):
+    itype_str = ",".join(itype_filter) if itype_filter else "all"
+    with open(output_tsv, "w") as fh:
+        fh.write(f"#\ttotal_frames:{total_frames}\tinteraction_types:{itype_str}\n")
+        fh.write("#\tColumns:\titype\tres1\tres2\tfrequency\n")
+        for itype, res1, res2, freq, _count in rows:
+            fh.write(f"{itype}\t{res1}\t{res2}\t{freq:.4f}\n")
+    print(f"[ultracontacts] Frequencies written to {output_tsv}  ({len(rows):,} pairs)")
+
+
+def default_freq_path(contacts_path: str) -> str:
+    """Derive the default frequency output path from the contacts parquet path."""
+    base, _ = os.path.splitext(contacts_path)
+    return base + "_frequencies.tsv"
 
 
 # ---------------------------------------------------------------------------
-# Legacy TSV reader (for compatibility with getcontacts output)
+# Legacy TSV reader (for cross-validation with getcontacts output)
 # ---------------------------------------------------------------------------
 
-def read_getcontacts_tsv(tsv_path: str) -> pd.DataFrame:
-    """
-    Parse a getcontacts-format TSV into a DataFrame matching our schema.
-    Useful for cross-validating ultracontacts vs getcontacts output.
-    """
+def read_getcontacts_tsv(tsv_path: str) -> list[dict]:
+    """Parse a getcontacts-format TSV into a list of dicts matching our schema."""
     rows = []
     with open(tsv_path) as fh:
         for line in fh:
@@ -153,8 +201,7 @@ def read_getcontacts_tsv(tsv_path: str) -> pd.DataFrame:
             if len(parts) < 4:
                 continue
             frame, itype, atom1, atom2 = int(parts[0]), parts[1], parts[2], parts[3]
-            # Strip VMD index (last colon-separated field)
             atom1 = ":".join(atom1.split(":")[:4])
             atom2 = ":".join(atom2.split(":")[:4])
             rows.append({"frame": frame, "itype": itype, "atom1": atom1, "atom2": atom2})
-    return pd.DataFrame(rows)
+    return rows
