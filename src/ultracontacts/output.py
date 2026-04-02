@@ -81,10 +81,42 @@ def finalize_parquet(writer, output_path: str):
 # Contact frequency computation — Polars streaming
 # ---------------------------------------------------------------------------
 
+# Interaction types subject to adjacent-residue filtering
+_ADJACENT_FILTER_ITYPES = {"vdw", "hp", "hplp", "hpll", "hppl"}
+
+
+def _filter_adjacent_vdw_hp(q):
+    """
+    Remove VDW/HP contacts between adjacent residues on the same chain.
+
+    Matches getcontacts behaviour (VDW_RES_DIFF=2 blanket exclusion for VDW/HP).
+    Operates on a lazy frame that already has atom1/atom2 columns.
+    """
+    import polars as pl
+
+    # Extract chain and resid from atom labels  ("A:ALA:124:CA" → chain="A", resid=124)
+    q = q.with_columns([
+        pl.col("atom1").str.split(":").list.get(0).alias("_chain1"),
+        pl.col("atom1").str.split(":").list.get(2).cast(pl.Int32).alias("_resid1"),
+        pl.col("atom2").str.split(":").list.get(0).alias("_chain2"),
+        pl.col("atom2").str.split(":").list.get(2).cast(pl.Int32).alias("_resid2"),
+    ])
+
+    is_adjacent_vdw_hp = (
+        pl.col("itype").is_in(list(_ADJACENT_FILTER_ITYPES))
+        & (pl.col("_chain1") == pl.col("_chain2"))
+        & ((pl.col("_resid1") - pl.col("_resid2")).abs() < 2)
+    )
+
+    q = q.filter(~is_adjacent_vdw_hp).drop(["_chain1", "_resid1", "_chain2", "_resid2"])
+    return q
+
+
 def compute_frequencies(
     parquet_path: str,
     output_path: Optional[str] = None,
     itype_filter: Optional[list[str]] = None,
+    include_all: bool = False,
 ) -> list[tuple[str, str, str, float, int]]:
     """
     Compute residue-level contact frequencies from a contacts Parquet file.
@@ -102,6 +134,9 @@ def compute_frequencies(
     output_path : str | None
         If given, write frequencies to this path.
         Extension determines format: .tsv → TSV text; anything else → Parquet.
+    include_all : bool
+        If False (default), adjacent-residue VDW/HP contacts are excluded
+        (matching getcontacts VDW_RES_DIFF=2). If True, all contacts are kept.
     """
     import polars as pl
 
@@ -109,6 +144,10 @@ def compute_frequencies(
 
     if itype_filter:
         q = q.filter(pl.col("itype").is_in(itype_filter))
+
+    # Filter adjacent-residue VDW/HP unless include_all
+    if not include_all:
+        q = _filter_adjacent_vdw_hp(q)
 
     # Count distinct frames (correct for strided/subsetted trajectories)
     total_frames = (
@@ -239,6 +278,7 @@ def compute_condensed(
     parquet_path: str,
     output_path: Optional[str] = None,
     itype_filter: Optional[list[str]] = None,
+    include_all: bool = False,
 ) -> dict[str, float]:
     """
     Compute a condensed (wide-format, single-row) contact probability table.
@@ -260,6 +300,10 @@ def compute_condensed(
 
     if itype_filter:
         q = q.filter(pl.col("itype").is_in(itype_filter))
+
+    # Filter adjacent-residue VDW/HP unless include_all
+    if not include_all:
+        q = _filter_adjacent_vdw_hp(q)
 
     total_frames = q.select(pl.col("frame").n_unique()).collect().item()
 

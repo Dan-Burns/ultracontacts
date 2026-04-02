@@ -137,6 +137,12 @@ def _build_contacts_parser(p: argparse.ArgumentParser):
              "  .parquet extension → Parquet (default); .tsv → TSV\n"
              "  default path: <contacts>_condensed.parquet",
     )
+    p.add_argument(
+        "--include-all",
+        action="store_true",
+        help="Include adjacent-residue VdW/HP sidechain contacts in frequency output.\n"
+             "By default these are excluded to match getcontacts behaviour.",
+    )
     _add_geom_args(p)
 
 
@@ -161,12 +167,12 @@ def _run_contacts(args):
     if not args.no_frequencies:
         freq_path = args.frequencies if args.frequencies else default_freq_path(args.output)
         print(f"[ultracontacts] Computing contact frequencies → {freq_path}")
-        compute_frequencies(args.output, output_path=freq_path)
+        compute_frequencies(args.output, output_path=freq_path, include_all=args.include_all)
 
     if args.condensed is not None:
         cond_path = args.condensed if args.condensed else default_condensed_path(args.output)
         print(f"[ultracontacts] Computing condensed frequencies → {cond_path}")
-        compute_condensed(args.output, output_path=cond_path)
+        compute_condensed(args.output, output_path=cond_path, include_all=args.include_all)
 
 
 # ---------------------------------------------------------------------------
@@ -190,17 +196,25 @@ def _build_frequencies_parser(p: argparse.ArgumentParser):
              "values = probability of any contact between that pair (itype-agnostic).\n"
              "Controls the format written to --output (does not add a second file).",
     )
+    p.add_argument(
+        "--include-all",
+        action="store_true",
+        help="Include adjacent-residue VdW/HP sidechain contacts.\n"
+             "By default these are excluded to match getcontacts behaviour.",
+    )
 
 
 def _run_frequencies(args):
     if args.condensed:
         out = args.output if args.output else default_condensed_path(args.input)
         print(f"[ultracontacts] Computing condensed frequencies → {out}")
-        compute_condensed(args.input, output_path=out, itype_filter=args.itype_filter)
+        compute_condensed(args.input, output_path=out, itype_filter=args.itype_filter,
+                          include_all=args.include_all)
     else:
         out = args.output if args.output else default_freq_path(args.input)
         print(f"[ultracontacts] Computing contact frequencies → {out}")
-        compute_frequencies(args.input, output_path=out, itype_filter=args.itype_filter)
+        compute_frequencies(args.input, output_path=out, itype_filter=args.itype_filter,
+                            include_all=args.include_all)
 
 
 # ---------------------------------------------------------------------------

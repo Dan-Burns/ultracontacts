@@ -25,6 +25,9 @@ def precompute_vdw_mask(groups: ChemicalGroups, res_diff: int,
         groups.vdw_chain1, groups.vdw_resid1,
         groups.vdw_chain2, groups.vdw_resid2,
         min_diff=res_diff,
+        bb_a=groups.vdw_is_bb1,
+        bb_b=groups.vdw_is_bb2,
+        adjacent_bb_only=True,
     )
     pair_mask = sele_mask & res_mask
     if sele1_eq_sele2:

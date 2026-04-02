@@ -148,6 +148,7 @@ class ChemicalGroups:
     hp_in_sele2: np.ndarray
     hp_chain: np.ndarray
     hp_resid: np.ndarray
+    hp_is_bb: np.ndarray            # (Hp,) bool
 
     # VdW — all heavy atoms in each selection
     vdw_indices1: np.ndarray        # (V1,)
@@ -156,6 +157,7 @@ class ChemicalGroups:
     vdw_chain1: np.ndarray
     vdw_resid1: np.ndarray
     vdw_is_ligand1: np.ndarray
+    vdw_is_bb1: np.ndarray          # (V1,) bool
 
     vdw_indices2: np.ndarray        # (V2,)
     vdw_labels2: list[str]
@@ -163,6 +165,7 @@ class ChemicalGroups:
     vdw_chain2: np.ndarray
     vdw_resid2: np.ndarray
     vdw_is_ligand2: np.ndarray
+    vdw_is_bb2: np.ndarray          # (V2,) bool
 
     # Per-atom info (indexed by Universe atom index)
     is_backbone: np.ndarray         # (N,) bool
@@ -406,7 +409,7 @@ def parse_topology(
     # HYDROPHOBICS
     # ===========================================================
     hp_idx_, hp_lbl_, hp_m1_, hp_m2_ = [], [], [], []
-    hp_chain_, hp_resid_ = [], []
+    hp_chain_, hp_resid_, hp_is_bb_ = [], [], []
 
     try:
         hp_sel_str = " or ".join(f"resname {r}" for r in HYDROPHOBIC_RESNAMES)
@@ -421,6 +424,7 @@ def parse_topology(
             hp_m2_.append(atom.index in sele2_set)
             hp_chain_.append(atom.chainID)
             hp_resid_.append(int(atom.resid))
+            hp_is_bb_.append(atom.name in BACKBONE_NAMES)
     except Exception as e:
         print(f"[ultracontacts] Warning: hydrophobic group detection failed: {e}")
 
@@ -428,7 +432,7 @@ def parse_topology(
     # VDW (all heavy atoms in sele1 / sele2)
     # ===========================================================
     def _build_vdw(ag):
-        idx_, lbl_, rad_, ch_, rid_, lig_ = [], [], [], [], [], []
+        idx_, lbl_, rad_, ch_, rid_, lig_, bb_ = [], [], [], [], [], [], []
         try:
             heavy = ag.select_atoms("not element H")
         except Exception:
@@ -440,7 +444,8 @@ def parse_topology(
             ch_.append(atom.chainID)
             rid_.append(int(atom.resid))
             lig_.append(bool(is_ligand[atom.index]))
-        return idx_, lbl_, rad_, ch_, rid_, lig_
+            bb_.append(atom.name in BACKBONE_NAMES)
+        return idx_, lbl_, rad_, ch_, rid_, lig_, bb_
 
     v1 = _build_vdw(sele1_ag)
     v2 = _build_vdw(sele2_ag)
@@ -492,6 +497,7 @@ def parse_topology(
         hp_in_sele2=_to_bool(hp_m2_),
         hp_chain=np.array(hp_chain_, dtype=object),
         hp_resid=np.array(hp_resid_, dtype=np.int32) if hp_resid_ else np.empty(0, dtype=np.int32),
+        hp_is_bb=_to_bool(hp_is_bb_),
         # vdw
         vdw_indices1=_to_i32(v1[0]),
         vdw_labels1=v1[1],
@@ -499,12 +505,14 @@ def parse_topology(
         vdw_chain1=np.array(v1[3], dtype=object),
         vdw_resid1=np.array(v1[4], dtype=np.int32) if v1[4] else np.empty(0, dtype=np.int32),
         vdw_is_ligand1=_to_bool(v1[5]),
+        vdw_is_bb1=_to_bool(v1[6]),
         vdw_indices2=_to_i32(v2[0]),
         vdw_labels2=v2[1],
         vdw_radii2=np.array(v2[2], dtype=np.float32) if v2[2] else np.empty(0, dtype=np.float32),
         vdw_chain2=np.array(v2[3], dtype=object),
         vdw_resid2=np.array(v2[4], dtype=np.int32) if v2[4] else np.empty(0, dtype=np.int32),
         vdw_is_ligand2=_to_bool(v2[5]),
+        vdw_is_bb2=_to_bool(v2[6]),
         # global
         is_backbone=is_backbone,
         is_ligand=is_ligand,
@@ -570,19 +578,38 @@ def build_dual_sele_mask(m1_a: np.ndarray, m2_a: np.ndarray,
 def build_residue_diff_mask(chain_a: np.ndarray, resid_a: np.ndarray,
                              chain_b: np.ndarray, resid_b: np.ndarray,
                              min_diff: int, bb_a: np.ndarray | None = None,
-                             bb_b: np.ndarray | None = None) -> np.ndarray:
+                             bb_b: np.ndarray | None = None,
+                             adjacent_bb_only: bool = False) -> np.ndarray:
     """
-    Returns bool (A, B) where True means the pair is more than min_diff residues apart
-    (on same chain), or on different chains. If bb_a/bb_b provided, only filters
-    when BOTH atoms are backbone.
+    Returns bool (A, B) where True means the pair is allowed (not excluded).
+
+    - Different chains: always allowed
+    - Same chain, |resid_diff| >= min_diff: allowed
+    - Same chain, |resid_diff| < min_diff: excluded (unless filtered by backbone)
+
+    If bb_a/bb_b provided and adjacent_bb_only=False: only filters when BOTH
+    atoms are backbone (original behaviour for H-bonds).
+
+    If adjacent_bb_only=True: same-residue (diff=0) always excluded;
+    adjacent residues (diff=1, same chain) excluded only when BOTH atoms are
+    backbone.  This allows sidechain contacts between adjacent residues while
+    filtering out covalently bonded backbone atoms.
     """
     same_chain = (chain_a[:, None] == chain_b[None, :])          # (A, B)
     res_diff = np.abs(resid_a[:, None].astype(int) -
                       resid_b[None, :].astype(int))               # (A, B)
-    too_close = same_chain & (res_diff < min_diff)                 # (A, B)
 
-    if bb_a is not None and bb_b is not None:
+    if adjacent_bb_only and bb_a is not None and bb_b is not None:
+        # Same residue: always excluded
+        same_res = same_chain & (res_diff == 0)
+        # Adjacent residue: only exclude backbone-backbone
+        adjacent = same_chain & (res_diff == 1)
         both_bb = bb_a[:, None] & bb_b[None, :]
-        too_close = too_close & both_bb
+        too_close = same_res | (adjacent & both_bb)
+    else:
+        too_close = same_chain & (res_diff < min_diff)             # (A, B)
+        if bb_a is not None and bb_b is not None:
+            both_bb = bb_a[:, None] & bb_b[None, :]
+            too_close = too_close & both_bb
 
     return ~too_close

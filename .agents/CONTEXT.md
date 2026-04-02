@@ -19,12 +19,14 @@ ultracontacts contacts   \
     [--no-frequencies]                    # skip auto frequency output
     [--frequencies PATH]                  # custom path for frequency file
     [--condensed [PATH]]                  # also write condensed wide-format
+    [--include-all]                       # keep adjacent-residue VdW/HP in frequencies
     [--openmm-system system.xml]          # use OpenMM bond topology
     [geometric override flags...]
 
 ultracontacts frequencies  \
     --input contacts.parquet  [--output PATH]
     [--condensed]             # output condensed format instead of long format
+    [--include-all]           # keep adjacent-residue VdW/HP contacts
     [--itype-filter hb sb ...]
 
 ```
@@ -72,13 +74,26 @@ Controls which atom pairs are excluded due to proximity along the chain.
 backbone-backbone pairs are filtered at the hbond_res_diff distance.
 Sidechain H-bonds between adjacent residues ARE computed.
 
-This means ultracontacts reports **VdW/HP sidechain contacts between adjacent
-residues** that getcontacts does NOT (getcontacts uses blanket `VDW_RES_DIFF=2`).
-This is an intentional design decision — these are real non-covalent contacts.
+This means ultracontacts **captures** VdW/HP sidechain contacts between adjacent
+residues (getcontacts does not — it blanket-excludes with `VDW_RES_DIFF=2`).
+
+**However**, these are **filtered out by default** at frequency time (in `output.py`)
+via `_filter_adjacent_vdw_hp()`.  Pass `--include-all` to keep them.
+
+This two-layer design means:
+- The atomistic parquet always has the full contact set (including adjacent sidechain VdW/HP)
+- The frequency output matches getcontacts by default
+- `--include-all` gives access to the extended contact set
 
 ### Frequency calculation (`output.py`)
 Uses **Polars lazy streaming** (`collect(streaming=True)`) — bounded memory,
 SIMD Rust string ops.
+
+**Adjacent-residue filter** (`_filter_adjacent_vdw_hp`):
+By default, rows with `itype in {vdw, hp, hplp, hpll, hppl}` where
+`chain1 == chain2 AND |resid1-resid2| < 2` are dropped.  The filter parses
+chain/resid from atom labels inline in the Polars lazy plan.  Disabled by
+`include_all=True`.
 
 Canonical residue-pair ordering matches getcontacts exactly:
 ```

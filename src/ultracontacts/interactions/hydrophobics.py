@@ -25,6 +25,9 @@ def precompute_hp_mask(groups: ChemicalGroups, res_diff: int) -> np.ndarray:
         groups.hp_chain, groups.hp_resid,
         groups.hp_chain, groups.hp_resid,
         min_diff=res_diff,
+        bb_a=groups.hp_is_bb,
+        bb_b=groups.hp_is_bb,
+        adjacent_bb_only=True,
     )
     np.fill_diagonal(res_mask, False)
     upper = np.triu(np.ones((Hp, Hp), dtype=bool), k=1)
