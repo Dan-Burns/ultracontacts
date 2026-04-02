@@ -14,7 +14,15 @@ dependencies = [
     "pandas",
     "polars",
     "tqdm",
+    "rdkit",
+    "cupy",  # CUDA-version-specific builds available: cupy-cuda12x, cupy-cuda13x, etc.
+             # Install the matching build for your CUDA version before installing ultracontacts.
 ]
+
+[project.optional-dependencies]
+cuda12 = ["cupy-cuda12x"]
+cuda13 = ["cupy-cuda13x"]
+cuda11 = ["cupy-cuda11x"]
 
 [project.scripts]
 ultracontacts = "ultracontacts.cli:main"
