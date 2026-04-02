@@ -29,8 +29,6 @@ def precompute_hbond_mask(groups: ChemicalGroups, res_diff: int) -> np.ndarray:
         groups.donor_chain, groups.donor_resid,
         groups.acceptor_chain, groups.acceptor_resid,
         min_diff=res_diff,
-        bb_a=groups.donor_is_bb,
-        bb_b=groups.acceptor_is_bb,
     )
     return sele_mask & res_mask
 

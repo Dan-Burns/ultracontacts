@@ -165,10 +165,11 @@ Tested on a 6354-frame gamma-secretase trajectory (~20K atoms):
    getcontacts but not ultracontacts.  Likely a pi-stacking edge case at the
    angle/psi boundary — investigate `ring_stacking` kernel threshold logic.
 
-4. **Bond detection fallback**: If no `--openmm-system` is provided and the
-   PDB has few/no CONECT records, `guess_bonds` may produce very few bonds,
-   resulting in **zero H-bond donors** detected.  Always recommend
-   `--openmm-system` for proteins with hydrogens.
+4. **Bond detection fallback**: If no `--openmm-system` is provided, `runner.py`
+   now checks whether the bond count is reasonable (>= N_atoms/2).  PDB files
+   with only a few CONECT records are detected as incomplete and `guess_bonds()`
+   is called.  If that also fails, the user is warned to pass `--openmm-system`.
+   MDAnalysis `guess_bonds()` can be slow and inaccurate on large systems.
 
 5. **CUDA 13 + cuDF**: RAPIDS cuDF does not yet support CUDA 13.x.  The
    frequency pipeline uses Polars (CPU, Rust/SIMD) instead.  Once cuDF
@@ -178,6 +179,13 @@ Tested on a 6354-frame gamma-secretase trajectory (~20K atoms):
 6. **Spatial hashing / cell lists**: Current O(N²) pair enumeration works well
    for systems up to ~20K atoms at 150fps.  For larger systems (>30K atoms),
    a CUDA cell-list implementation would reduce to O(N).
+
+7. **ParmEd-based universal bond loader**: To support GROMACS (.top), AMBER
+   (.prmtop), CHARMM (.psf), and other topology formats without needing
+   `--openmm-system`, add a `--parmed-topology` flag or auto-detect format.
+   ParmEd can parse all major MD formats and expose `.bonds` as atom index
+   pairs.  This would replace the current OpenMM XML parser with a single
+   unified path: `parmed.load_file(path).bonds → MDAnalysis bonds`.
 
 ---
 

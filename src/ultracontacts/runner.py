@@ -109,18 +109,29 @@ def compute_contacts(
             print(f"[ultracontacts] Error parsing OpenMM system: {e}")
 
     if "hb" in itypes:
-        has_bonds = False
+        n_bonds = 0
         try:
-            if hasattr(u, "bonds") and len(u.bonds) > 0:
-                has_bonds = True
+            if hasattr(u, "bonds"):
+                n_bonds = len(u.bonds)
         except Exception:
             pass
-        if not has_bonds:
-            print("[ultracontacts] Guessing bonds (no bond info in topology)…")
+        # A reasonable protein has ~1 bond per atom; 5 CONECT records for
+        # 20K atoms is clearly incomplete
+        if n_bonds < len(u.atoms) // 2:
+            if n_bonds > 0:
+                print(f"[ultracontacts] Warning: only {n_bonds} bonds for {len(u.atoms)} atoms — incomplete bond info")
+            print("[ultracontacts] Guessing bonds (this may take a moment)…")
             try:
                 u.atoms.guess_bonds()
+                n_bonds_new = len(u.bonds)
+                print(f"[ultracontacts] Guessed {n_bonds_new} bonds")
+                if n_bonds_new < len(u.atoms) // 2:
+                    print("[ultracontacts] ⚠ Bond guessing produced few bonds — "
+                          "H-bond detection will be unreliable.\n"
+                          "  → Pass --openmm-system system.xml for accurate results.")
             except Exception as e:
-                print(f"[ultracontacts] Warning: bond guessing failed: {e}")
+                print(f"[ultracontacts] Warning: bond guessing failed: {e}\n"
+                      "  → Pass --openmm-system system.xml for H-bond detection.")
 
     # ---- Parse chemical groups ----
     print("[ultracontacts] Parsing chemical groups…")
