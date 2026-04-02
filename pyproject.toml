@@ -8,12 +8,11 @@ version = "0.1.0"
 description = "GPU-accelerated, chemical-group-aware molecular contact analysis"
 requires-python = ">=3.10"
 dependencies = [
-    "jax",
-    "jaxlib",
     "mdanalysis>=2.0",
     "numpy",
     "pyarrow",
     "pandas",
+    "tqdm",
 ]
 
 [project.scripts]
