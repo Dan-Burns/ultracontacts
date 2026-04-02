@@ -12,6 +12,7 @@ import time
 from typing import Optional
 
 import numpy as np
+from tqdm import tqdm
 import cupy as cp
 import MDAnalysis as mda
 
@@ -179,33 +180,29 @@ def compute_contacts(
             )
             buf_f.clear(); buf_it.clear(); buf_a1.clear(); buf_a2.clear()
 
-    t_batch = time.perf_counter()
+    with tqdm(total=n_frames, unit="frame", desc="Computing contacts") as pbar:
+        for fi, abs_frame in enumerate(frames_to_process):
+            # Upload coordinates for this frame (flat float32 on GPU)
+            u.trajectory[abs_frame]
+            coords_gpu = cp.asarray(u.atoms.positions.ravel(), dtype=cp.float32)
 
-    for fi, abs_frame in enumerate(frames_to_process):
-        # Upload coordinates for this frame (flat float32 on GPU)
-        u.trajectory[abs_frame]
-        coords_gpu = cp.asarray(u.atoms.positions.ravel(), dtype=cp.float32)
+            # Fused kernel calls — each returns only sparse hit indices
+            if "sb" in itypes:  _add(compute_salt_bridges(coords_gpu, gpu["sb"], geom, abs_frame))
+            if "hp" in itypes:  _add(compute_hydrophobics(coords_gpu, gpu["hp"], geom, abs_frame))
+            if "vdw" in itypes: _add(compute_vanderwaals(coords_gpu, gpu["vdw"], geom, abs_frame))
+            if "hb" in itypes:  _add(compute_hbonds(coords_gpu, gpu["hb"], geom, abs_frame))
+            if "ps" in itypes:  _add(compute_pi_stacking(coords_gpu, gpu["rings"], geom, abs_frame))
+            if "ts" in itypes:  _add(compute_t_stacking(coords_gpu, gpu["rings"], geom, abs_frame))
+            if "pc" in itypes:  _add(compute_pi_cation(coords_gpu, gpu["pc"], geom, abs_frame))
 
-        # Fused kernel calls — each returns only sparse hit indices
-        if "sb" in itypes:  _add(compute_salt_bridges(coords_gpu, gpu["sb"], geom, abs_frame))
-        if "hp" in itypes:  _add(compute_hydrophobics(coords_gpu, gpu["hp"], geom, abs_frame))
-        if "vdw" in itypes: _add(compute_vanderwaals(coords_gpu, gpu["vdw"], geom, abs_frame))
-        if "hb" in itypes:  _add(compute_hbonds(coords_gpu, gpu["hb"], geom, abs_frame))
-        if "ps" in itypes:  _add(compute_pi_stacking(coords_gpu, gpu["rings"], geom, abs_frame))
-        if "ts" in itypes:  _add(compute_t_stacking(coords_gpu, gpu["rings"], geom, abs_frame))
-        if "pc" in itypes:  _add(compute_pi_cation(coords_gpu, gpu["pc"], geom, abs_frame))
+            pbar.update(1)
 
-        # Periodic flush + progress
-        if (fi + 1) % WRITE_EVERY == 0 or fi == n_frames - 1:
-            n_buf = sum(len(a) for a in buf_f) if buf_f else 0
-            n_contacts_total += n_buf
-            _flush()
-            elapsed_batch = time.perf_counter() - t_batch
-            fps = min(fi + 1, WRITE_EVERY) / elapsed_batch if elapsed_batch > 0 else 0
-            remaining = (n_frames - fi - 1) / fps if fps > 0 else 0
-            print(f"  frame {fi+1}/{n_frames} | {n_buf:,} contacts | "
-                  f"{elapsed_batch:.1f}s ({fps:.1f} fps) | ~{remaining:.0f}s left")
-            t_batch = time.perf_counter()
+            # Periodic flush + update postfix stats
+            if (fi + 1) % WRITE_EVERY == 0 or fi == n_frames - 1:
+                n_buf = sum(len(a) for a in buf_f) if buf_f else 0
+                n_contacts_total += n_buf
+                _flush()
+                pbar.set_postfix(contacts=f"{n_contacts_total:,}")
 
     finalize_parquet(parquet_writer, output)
 
