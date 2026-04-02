@@ -26,6 +26,27 @@ AROMATIC_DEFS: dict[str, list[str]] = {
     "HID": ["CG", "CE1", "CD2"],
 }
 
+# Nucleic acid aromatic rings — one triad per ring, purines have 2 fused rings.
+# Atom names follow standard AMBER/CHARMM nucleic naming.
+# Each entry: (resname_variants, [triad1_names, triad2_names, ...])
+NUCLEIC_RING_DEFS: list[tuple[frozenset, list[list[str]]]] = [
+    # Adenine: 6-membered (C2,C4,C6) + 5-membered (C4,C5,N7)
+    (frozenset({"ADE", "DA", "DA3", "DA5", "A"}),
+     [["C2", "C4", "C6"], ["C4", "C5", "N7"]]),
+    # Guanine: 6-membered (C2,C4,C6) + 5-membered (C4,C5,N7)
+    (frozenset({"GUA", "DG", "DG3", "DG5", "G"}),
+     [["C2", "C4", "C6"], ["C4", "C5", "N7"]]),
+    # Cytosine: 6-membered only
+    (frozenset({"CYT", "DC", "DC3", "DC5", "C"}),
+     [["C2", "C4", "C6"]]),
+    # Thymine: 6-membered only
+    (frozenset({"THY", "DT", "DT3", "DT5", "T"}),
+     [["C2", "C4", "C6"]]),
+    # Uracil: 6-membered only
+    (frozenset({"URA", "URI", "U"}),
+     [["C2", "C4", "C6"]]),
+]
+
 ANION_DEFS: dict[str, list[str]] = {
     "ASP": ["OD1", "OD2"],
     "GLU": ["OE1", "OE2"],
@@ -195,6 +216,110 @@ def _get_vdw(element: str) -> float:
     return VDW_RADII.get(element.upper(), VDW_DEFAULT)
 
 
+def _collect_rdkit_rings(
+    lig_ag,
+    sele1_set: set,
+    sele2_set: set,
+    ring_idx_rows: list,
+    ring_lbls: list,
+    ring_m1: list,
+    ring_m2: list,
+) -> None:
+    """
+    Detect aromatic rings in a ligand AtomGroup using RDKit's SSSR algorithm.
+
+    For each unique 5- or 6-membered aromatic ring, selects 3 maximally-spaced
+    atoms as the representative triad for centroid + normal computation, then
+    appends to the shared ring lists.
+
+    Silently returns if RDKit is not installed or the ligand has no bonds.
+    """
+    try:
+        from rdkit import Chem
+    except ImportError:
+        return
+
+    # Process each residue separately so multi-residue ligands work
+    for res in lig_ag.residues:
+        atoms = list(res.atoms)
+        if len(atoms) < 3:
+            continue
+
+        # Build local index map: RDKit atom idx → universe atom idx
+        local_to_global = {i: a.index for i, a in enumerate(atoms)}
+        name_map = {a.index: a for a in atoms}
+
+        # Build RDKit mol from scratch (edit mol — no SMILES needed)
+        em = Chem.RWMol()
+        for atom in atoms:
+            elem = atom.element.capitalize() if atom.element else "C"
+            try:
+                rd_atom = Chem.Atom(elem)
+            except Exception:
+                rd_atom = Chem.Atom("C")
+            em.AddAtom(rd_atom)
+
+        # Add bonds from MDAnalysis topology
+        global_to_local = {a.index: i for i, a in enumerate(atoms)}
+        added = set()
+        try:
+            for bond in res.atoms.bonds:
+                a1_idx = bond.atoms[0].index
+                a2_idx = bond.atoms[1].index
+                local1 = global_to_local.get(a1_idx)
+                local2 = global_to_local.get(a2_idx)
+                if local1 is None or local2 is None:
+                    continue
+                key = (min(local1, local2), max(local1, local2))
+                if key not in added:
+                    em.AddBond(local1, local2, Chem.BondType.SINGLE)
+                    added.add(key)
+        except Exception:
+            return  # No bond info
+
+        try:
+            mol = em.GetMol()
+            Chem.SanitizeMol(mol)
+        except Exception:
+            return
+
+        # Get smallest set of smallest rings
+        ring_info = mol.GetRingInfo()
+        atom_rings = ring_info.AtomRings()
+
+        seen_rings = set()
+        for ring in atom_rings:
+            n = len(ring)
+            if n not in (5, 6):
+                continue
+
+            # Check aromaticity: majority of ring atoms should be aromatic
+            aromatic_count = sum(1 for ri in ring if mol.GetAtomWithIdx(ri).GetIsAromatic())
+            if aromatic_count < n - 1:
+                continue
+
+            # Canonical ring key to deduplicate fused rings
+            ring_key = frozenset(ring)
+            if ring_key in seen_rings:
+                continue
+            seen_rings.add(ring_key)
+
+            # Pick 3 maximally-spaced atoms: first, middle, and ~2/3 around ring
+            ring_list = list(ring)
+            if n == 6:
+                triad_local = [ring_list[0], ring_list[2], ring_list[4]]
+            else:  # 5-membered
+                triad_local = [ring_list[0], ring_list[1], ring_list[3]]
+
+            global_idxs = [local_to_global[i] for i in triad_local]
+
+            ring_idx_rows.append(global_idxs)
+            ring_lbls.append(_atom_label(name_map[global_idxs[0]]))
+            ring_m1.append(any(gi in sele1_set for gi in global_idxs))
+            ring_m2.append(any(gi in sele2_set for gi in global_idxs))
+
+
+
 # ---------------------------------------------------------------------------
 # Main function
 # ---------------------------------------------------------------------------
@@ -255,6 +380,7 @@ def parse_topology(
     # ===========================================================
     ring_idx_rows, ring_lbls, ring_m1, ring_m2 = [], [], [], []
 
+    # --- Protein aromatic rings (getcontacts-compatible hardcoded triads) ---
     for resname, atom_names in AROMATIC_DEFS.items():
         try:
             res_group = u.select_atoms(f"resname {resname}").residues
@@ -270,19 +396,36 @@ def parse_topology(
             ring_m1.append(any(i in sele1_set for i in idxs))
             ring_m2.append(any(i in sele2_set for i in idxs))
 
-    # Nucleic rings (C2/C4/C6 proxy)
+    # --- Nucleic acid aromatic rings (per-base proper triads) ---
     try:
         for res in u.select_atoms("nucleic").residues:
             atom_map = {a.name: a for a in res.atoms}
-            names = ["C2", "C4", "C6"]
-            if all(n in atom_map for n in names):
-                idxs = [atom_map[n].index for n in names]
-                ring_idx_rows.append(idxs)
-                ring_lbls.append(_atom_label(atom_map["C2"]))
-                ring_m1.append(any(i in sele1_set for i in idxs))
-                ring_m2.append(any(i in sele2_set for i in idxs))
+            for resnames_set, triads in NUCLEIC_RING_DEFS:
+                if res.resname in resnames_set:
+                    for triad in triads:
+                        if all(n in atom_map for n in triad):
+                            idxs = [atom_map[n].index for n in triad]
+                            ring_idx_rows.append(idxs)
+                            ring_lbls.append(_atom_label(atom_map[triad[0]]))
+                            ring_m1.append(any(i in sele1_set for i in idxs))
+                            ring_m2.append(any(i in sele2_set for i in idxs))
+                    break
     except Exception:
         pass
+
+    # --- Ligand/small-molecule aromatic rings (RDKit-based, optional) ---
+    try:
+        lig_ag = u.select_atoms(
+            f"({sele1_str} or {sele2_str}) and not protein and not nucleic "
+            "and not (water or resname HOH TIP3 TIP3P SOL)"
+        )
+        if len(lig_ag) > 0:
+            _collect_rdkit_rings(
+                lig_ag, sele1_set, sele2_set,
+                ring_idx_rows, ring_lbls, ring_m1, ring_m2,
+            )
+    except Exception as e:
+        pass  # RDKit not available or ligand has no recognisable rings
 
     ring_indices = (np.array(ring_idx_rows, dtype=np.int32)
                     if ring_idx_rows else np.empty((0, 3), dtype=np.int32))
