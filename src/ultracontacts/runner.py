@@ -40,7 +40,7 @@ DEFAULT_GEOM = {
     "TS_CUTOFF_ANG": 30.0,
     "TS_PSI_ANG": 45.0,
     "HBOND_CUTOFF_DIST": 3.5,
-    "HBOND_CUTOFF_ANG": 150.0,
+    "HBOND_CUTOFF_ANG": 110.0,   # VMD uses 70° deviation from linear = D-H-A > 110°
     "HBOND_RES_DIFF": 1,
     "VDW_EPSILON": 0.5,
     "VDW_RES_DIFF": 2,
