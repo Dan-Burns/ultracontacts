@@ -16,7 +16,10 @@ import os
 import sys
 
 from .runner import compute_contacts, DEFAULT_GEOM
-from .output import compute_frequencies, default_freq_path
+from .output import (
+    compute_frequencies, default_freq_path,
+    compute_condensed, default_condensed_path,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -106,15 +109,33 @@ def _build_contacts_parser(p: argparse.ArgumentParser):
                    help="Frame stride [default: 1]")
     p.add_argument("--n-gpus",       type=int, default=None, metavar="INT",
                    help="Number of GPUs [default: 1]")
-    p.add_argument(
+
+    freq_grp = p.add_mutually_exclusive_group()
+    freq_grp.add_argument(
+        "--no-frequencies",
+        action="store_true",
+        help="Skip frequency calculation (frequencies are computed by default)",
+    )
+    freq_grp.add_argument(
         "--frequencies",
-        nargs="?",          # 0 or 1 argument
-        const="",           # --frequencies with no path → use auto path
-        default=None,       # flag not provided → no frequency output
-        metavar="TSV",
-        help="Also compute contact frequencies after the contact calculation.\n"
-             "Optionally provide the output TSV path; if omitted the file is\n"
-             "written next to --output as <name>_frequencies.tsv",
+        metavar="PATH",
+        default=None,
+        help="Custom path for the frequency output file.\n"
+             "  .parquet extension → Parquet (default if omitted)\n"
+             "  .tsv extension     → tab-separated text\n"
+             "  default path: <contacts>_frequencies.parquet",
+    )
+    p.add_argument(
+        "--condensed",
+        nargs="?",
+        const="",          # --condensed with no path → auto path
+        default=None,      # flag absent → no condensed output
+        metavar="PATH",
+        help="Also write a condensed wide-format frequency file.\n"
+             "One row, columns = 'res1-res2' pair names, values = contact probability\n"
+             "  (any itype, any frame where contact exists counts once).\n"
+             "  .parquet extension → Parquet (default); .tsv → TSV\n"
+             "  default path: <contacts>_condensed.parquet",
     )
     _add_geom_args(p)
 
@@ -137,10 +158,15 @@ def _run_contacts(args):
         n_gpus=args.n_gpus,
     )
 
-    if args.frequencies is not None:
+    if not args.no_frequencies:
         freq_path = args.frequencies if args.frequencies else default_freq_path(args.output)
         print(f"[ultracontacts] Computing contact frequencies → {freq_path}")
-        compute_frequencies(args.output, output_tsv=freq_path)
+        compute_frequencies(args.output, output_path=freq_path)
+
+    if args.condensed is not None:
+        cond_path = args.condensed if args.condensed else default_condensed_path(args.output)
+        print(f"[ultracontacts] Computing condensed frequencies → {cond_path}")
+        compute_condensed(args.output, output_path=cond_path)
 
 
 # ---------------------------------------------------------------------------
@@ -150,16 +176,31 @@ def _run_contacts(args):
 def _build_frequencies_parser(p: argparse.ArgumentParser):
     p.add_argument("--input",  metavar="PARQUET", required=True,
                    help="Path to contacts .parquet file")
-    p.add_argument("--output", metavar="TSV", default=None,
-                   help="Output TSV path [default: <input>_frequencies.tsv]")
+    p.add_argument("--output", metavar="PATH", default=None,
+                   help="Output path.  Format determined by extension and --condensed flag.\n"
+                        "  default (no --condensed): <input>_frequencies.parquet\n"
+                        "  with --condensed:         <input>_condensed.parquet\n"
+                        "  .parquet → Parquet (default); .tsv → tab-separated text")
     p.add_argument("--itype-filter", nargs="+", default=None, metavar="TYPE",
                    help="Only include these interaction types")
+    p.add_argument(
+        "--condensed",
+        action="store_true",
+        help="Output condensed wide-format: one row, columns = 'res1-res2' pair names,\n"
+             "values = probability of any contact between that pair (itype-agnostic).\n"
+             "Controls the format written to --output (does not add a second file).",
+    )
 
 
 def _run_frequencies(args):
-    out = args.output if args.output else default_freq_path(args.input)
-    print(f"[ultracontacts] Computing contact frequencies → {out}")
-    compute_frequencies(args.input, output_tsv=out, itype_filter=args.itype_filter)
+    if args.condensed:
+        out = args.output if args.output else default_condensed_path(args.input)
+        print(f"[ultracontacts] Computing condensed frequencies → {out}")
+        compute_condensed(args.input, output_path=out, itype_filter=args.itype_filter)
+    else:
+        out = args.output if args.output else default_freq_path(args.input)
+        print(f"[ultracontacts] Computing contact frequencies → {out}")
+        compute_frequencies(args.input, output_path=out, itype_filter=args.itype_filter)
 
 
 # ---------------------------------------------------------------------------

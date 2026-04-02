@@ -4,17 +4,16 @@ output.py — Write contacts to Parquet and compute contact frequencies.
 Parquet schema:
     frame  : int32
     itype  : string
-    atom1  : string   "chain:resname:resid:name"
-    atom2  : string   "chain:resname:resid:name"
+    atom1  : string   "chain:resname:resid:atomname"
+    atom2  : string   "chain:resname:resid:atomname"
 
-Frequency TSV output:
+Frequency TSV output (getcontacts-compatible):
     itype  res1  res2  frequency
-where res1/res2 = "chain:resname:resid"
+where res1/res2 = "chain:resname:resid"  and  res1 <= res2  lexicographically.
 """
 
 from __future__ import annotations
 import os
-from collections import defaultdict
 from typing import Optional
 
 import numpy as np
@@ -36,7 +35,7 @@ _SCHEMA = pa.schema([
 def write_parquet_chunk(
     contacts: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
     output_path: str,
-    writer,          # pq.ParquetWriter | None
+    writer,
     itypes: list[str],
     beg: int,
     end: int,
@@ -79,90 +78,130 @@ def finalize_parquet(writer, output_path: str):
 
 
 # ---------------------------------------------------------------------------
-# Contact frequency computation
+# Contact frequency computation — Polars streaming
 # ---------------------------------------------------------------------------
-
-def _atom_to_res(atom: str) -> str:
-    """'A:ALA:1:CA'  →  'A:ALA:1'"""
-    idx = atom.rfind(":")
-    return atom[:idx] if idx != -1 else atom
-
 
 def compute_frequencies(
     parquet_path: str,
-    output_tsv: Optional[str] = None,
+    output_path: Optional[str] = None,
     itype_filter: Optional[list[str]] = None,
 ) -> list[tuple[str, str, str, float, int]]:
     """
     Compute residue-level contact frequencies from a contacts Parquet file.
 
-    Uses a streaming row-group scan — memory stays flat regardless of file size.
-    Per-frame residue deduplication mirrors getcontacts' res_contacts_xl logic:
-    multiple atom-level contacts between the same residue pair within one frame
-    count as a single contact.
+    Uses Polars lazy streaming — processes the parquet in bounded memory with
+    SIMD-vectorised Rust string ops. Matches getcontacts canonical ordering:
+      resi1 = ":".join(atom1.split(":")[0:3])
+      resi2 = ":".join(atom2.split(":")[0:3])
+      if resi2 < resi1: resi1, resi2 = resi2, resi1  (standard lexicographic)
 
-    Parameters
-    ----------
-    parquet_path : str
-        Path to the contacts .parquet file produced by ultracontacts.
-    output_tsv : str | None
-        If given, write tab-separated frequencies to this path.
-    itype_filter : list[str] | None
-        If given, only include these interaction types.
+    Per-frame residue deduplication: multiple atom-level contacts between the
+    same residue pair in one frame count as a single contact.
+    total_frames = number of distinct frame values present in the file.
 
-    Returns
-    -------
-    List of (itype, res1, res2, frequency, count) sorted by itype, frequency desc.
+    output_path : str | None
+        If given, write frequencies to this path.
+        Extension determines format: .tsv → TSV text; anything else → Parquet.
     """
-    itype_set = set(itype_filter) if itype_filter else None
+    import polars as pl
 
-    pf = pq.ParquetFile(parquet_path)
-    total_frames = 0
+    q = pl.scan_parquet(parquet_path)
 
-    # counts[(itype, res1, res2)] = number of frames in which this pair contacts
-    counts: dict[tuple[str, str, str], int] = defaultdict(int)
+    if itype_filter:
+        q = q.filter(pl.col("itype").is_in(itype_filter))
 
-    for batch in pf.iter_batches(columns=["frame", "itype", "atom1", "atom2"]):
-        frames_col = batch.column("frame").to_pylist()
-        itype_col  = batch.column("itype").to_pylist()
-        atom1_col  = batch.column("atom1").to_pylist()
-        atom2_col  = batch.column("atom2").to_pylist()
+    # Count distinct frames (correct for strided/subsetted trajectories)
+    total_frames = (
+        q.select(pl.col("frame").n_unique())
+        .collect()
+        .item()
+    )
 
-        # Group rows by frame within this batch
-        # Use a per-frame set to deduplicate at residue level
-        frame_pairs: dict[int, dict[str, set[tuple[str, str]]]] = defaultdict(lambda: defaultdict(set))
+    if total_frames == 0:
+        if output_path:
+            _write_frequencies([], output_path, 0, itype_filter)
+        return []
 
-        for frame, itype, atom1, atom2 in zip(frames_col, itype_col, atom1_col, atom2_col):
-            if itype_set and itype not in itype_set:
-                continue
-            res1 = _atom_to_res(atom1)
-            res2 = _atom_to_res(atom2)
-            # canonical order
-            if res2 < res1:
-                res1, res2 = res2, res1
-            frame_pairs[frame][itype].add((res1, res2))
+    # Strip atom name → residue label "chain:resname:resid" (first 3 fields)
+    # Mirrors: ":".join(atom.split(":")[0:3])
+    q = q.with_columns([
+        pl.col("atom1").str.split(":").list.slice(0, 3).list.join(":").alias("res1_raw"),
+        pl.col("atom2").str.split(":").list.slice(0, 3).list.join(":").alias("res2_raw"),
+    ])
 
-        # Accumulate into counts; track max frame for total_frames
-        for frame, itype_dict in frame_pairs.items():
-            if frame + 1 > total_frames:
-                total_frames = frame + 1
-            for itype, pairs in itype_dict.items():
-                for res1, res2 in pairs:
-                    counts[(itype, res1, res2)] += 1
+    # Canonical ordering: res1 <= res2  (lexicographic — matches getcontacts)
+    q = q.with_columns([
+        pl.when(pl.col("res2_raw") < pl.col("res1_raw"))
+          .then(pl.col("res2_raw"))
+          .otherwise(pl.col("res1_raw"))
+          .alias("res1"),
+        pl.when(pl.col("res2_raw") < pl.col("res1_raw"))
+          .then(pl.col("res1_raw"))
+          .otherwise(pl.col("res2_raw"))
+          .alias("res2"),
+    ])
 
-    if total_frames == 0 or not counts:
-        rows = []
-    else:
-        rows = [
-            (itype, res1, res2, count / total_frames, count)
-            for (itype, res1, res2), count in counts.items()
-        ]
-        rows.sort(key=lambda r: (r[0], -r[3]))  # itype asc, frequency desc
+    # Deduplicate: one contact per (frame, itype, res1, res2)
+    q = q.unique(subset=["frame", "itype", "res1", "res2"])
 
-    if output_tsv:
-        _write_frequency_tsv(rows, output_tsv, total_frames, itype_filter)
+    # Count frames per (itype, res1, res2)
+    result = (
+        q.group_by(["itype", "res1", "res2"])
+         .agg(pl.len().alias("count"))
+         .with_columns((pl.col("count") / total_frames).alias("frequency"))
+         .sort(["itype", "frequency"], descending=[False, True])
+         .collect(streaming=True)
+    )
+
+    rows = [
+        (r["itype"], r["res1"], r["res2"], r["frequency"], r["count"])
+        for r in result.iter_rows(named=True)
+    ]
+
+    if output_path:
+        _write_frequencies(rows, output_path, total_frames, itype_filter)
 
     return rows
+
+
+def _write_frequencies(
+    rows: list[tuple],
+    output_path: str,
+    total_frames: int,
+    itype_filter: Optional[list[str]],
+):
+    """Write frequencies to parquet or TSV based on file extension."""
+    if output_path.lower().endswith(".tsv"):
+        _write_frequency_tsv(rows, output_path, total_frames, itype_filter)
+    else:
+        _write_frequency_parquet(rows, output_path, total_frames, itype_filter)
+
+
+def _write_frequency_parquet(
+    rows: list[tuple],
+    output_path: str,
+    total_frames: int,
+    itype_filter: Optional[list[str]],
+):
+    import polars as pl
+    if rows:
+        df = pl.DataFrame({
+            "itype":     [r[0] for r in rows],
+            "res1":      [r[1] for r in rows],
+            "res2":      [r[2] for r in rows],
+            "frequency": [r[3] for r in rows],
+            "count":     [r[4] for r in rows],
+        })
+    else:
+        df = pl.DataFrame({
+            "itype": pl.Series([], dtype=pl.Utf8),
+            "res1":  pl.Series([], dtype=pl.Utf8),
+            "res2":  pl.Series([], dtype=pl.Utf8),
+            "frequency": pl.Series([], dtype=pl.Float64),
+            "count":     pl.Series([], dtype=pl.Int64),
+        })
+    df.write_parquet(output_path, compression="snappy")
+    print(f"[ultracontacts] Frequencies written to {output_path}  ({len(rows):,} pairs)")
 
 
 def _write_frequency_tsv(
@@ -181,9 +220,105 @@ def _write_frequency_tsv(
 
 
 def default_freq_path(contacts_path: str) -> str:
-    """Derive the default frequency output path from the contacts parquet path."""
+    """Derive the default frequency output path (parquet) from the contacts path."""
     base, _ = os.path.splitext(contacts_path)
-    return base + "_frequencies.tsv"
+    return base + "_frequencies.parquet"
+
+
+def default_condensed_path(contacts_path: str) -> str:
+    """Derive the default condensed output path (parquet) from the contacts path."""
+    base, _ = os.path.splitext(contacts_path)
+    return base + "_condensed.parquet"
+
+
+# ---------------------------------------------------------------------------
+# Condensed frequency computation
+# ---------------------------------------------------------------------------
+
+def compute_condensed(
+    parquet_path: str,
+    output_path: Optional[str] = None,
+    itype_filter: Optional[list[str]] = None,
+) -> dict[str, float]:
+    """
+    Compute a condensed (wide-format, single-row) contact probability table.
+
+    Each column is a residue pair formatted as "res1-res2" where res1 ≤ res2
+    lexicographically (matching getcontacts canonical ordering).  The single
+    row value is the fraction of frames in which *any* contact of *any* type
+    exists between those two residues.
+
+    Output file:
+      .parquet (default) — Polars single-row wide DataFrame
+      .tsv               — tab-separated, header row + data row
+
+    Returns dict mapping pair name → frequency.
+    """
+    import polars as pl
+
+    q = pl.scan_parquet(parquet_path)
+
+    if itype_filter:
+        q = q.filter(pl.col("itype").is_in(itype_filter))
+
+    total_frames = q.select(pl.col("frame").n_unique()).collect().item()
+
+    if total_frames == 0:
+        if output_path:
+            _write_condensed({}, output_path)
+        return {}
+
+    # Residue labels — same canonical extraction as compute_frequencies
+    q = q.with_columns([
+        pl.col("atom1").str.split(":").list.slice(0, 3).list.join(":").alias("res1_raw"),
+        pl.col("atom2").str.split(":").list.slice(0, 3).list.join(":").alias("res2_raw"),
+    ]).with_columns([
+        pl.when(pl.col("res2_raw") < pl.col("res1_raw"))
+          .then(pl.col("res2_raw")).otherwise(pl.col("res1_raw")).alias("res1"),
+        pl.when(pl.col("res2_raw") < pl.col("res1_raw"))
+          .then(pl.col("res1_raw")).otherwise(pl.col("res2_raw")).alias("res2"),
+    ])
+
+    # Deduplicate across ALL itypes: any contact between res pair in a frame = 1
+    result = (
+        q.unique(subset=["frame", "res1", "res2"])
+         .group_by(["res1", "res2"])
+         .agg(pl.len().alias("count"))
+         .with_columns([
+             (pl.col("count") / total_frames).alias("frequency"),
+             (pl.col("res1") + "-" + pl.col("res2")).alias("pair"),
+         ])
+         .select(["pair", "frequency"])
+         .sort("pair")            # lexicographic column order for consistency
+         .collect(streaming=True)
+    )
+
+    pairs = result["pair"].to_list()
+    freqs = result["frequency"].to_list()
+    freq_map = dict(zip(pairs, freqs))
+
+    if output_path:
+        _write_condensed(freq_map, output_path)
+
+    return freq_map
+
+
+def _write_condensed(freq_map: dict[str, float], output_path: str):
+    import polars as pl
+
+    if freq_map:
+        # Columns sorted lexicographically (guaranteed — pairs were sorted above)
+        df = pl.DataFrame({pair: [freq] for pair, freq in freq_map.items()})
+    else:
+        df = pl.DataFrame()
+
+    if output_path.lower().endswith(".tsv"):
+        df.write_csv(output_path, separator="\t")
+    else:
+        df.write_parquet(output_path, compression="snappy")
+
+    print(f"[ultracontacts] Condensed frequencies written to {output_path}"
+          f"  ({len(freq_map):,} pairs)")
 
 
 # ---------------------------------------------------------------------------
