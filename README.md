@@ -1,19 +1,18 @@
 # ultracontacts
 
-GPU-accelerated molecular contact analysis. Computes hydrogen bonds, salt bridges, pi-stacking, T-stacking, pi-cation, van der Waals, and hydrophobic contacts across MD trajectories, outputting a Parquet file for downstream analysis.
+GPU-accelerated molecular contact analysis. Computes hydrogen bonds, salt bridges, pi-stacking, T-stacking, pi-cation, van der Waals, and hydrophobic contacts across MD trajectories, outputting compressed Parquet files for downstream analysis.
 
-**~150 frames/second** on a modern GPU (tested on a 6354-frame, ~6000-atom protein trajectory completing in ~42 seconds).
+**~150 frames/second** on a modern GPU (tested on a 6354-frame, ~20,000-atom protein trajectory completing in ~42 seconds).
 
 ## Requirements
 
 - NVIDIA GPU with CUDA support
-- [`cupy`](https://cupy.dev/) (for CUDA kernels) — install matching your CUDA version:
+- [`cupy`](https://cupy.dev/) matching your CUDA version:
   ```bash
-  conda install -c conda-forge cupy
-  # or
-  pip install cupy-cuda12x  # adjust for your CUDA version
+  pip install cupy-cuda12x   # CUDA 12
+  pip install cupy-cuda13x   # CUDA 13
   ```
-- `MDAnalysis`, `pyarrow`, `tqdm`, `numpy`
+- `MDAnalysis`, `pyarrow`, `polars`, `tqdm`, `numpy`
 
 ## Installation
 
@@ -23,103 +22,141 @@ pip install -e .
 
 ## Usage
 
-### Basic
+### Contact calculation
 
 ```bash
-ultracontacts \
+ultracontacts contacts \
   --topology protein.pdb \
   --trajectory sim.dcd \
   --output contacts.parquet
 ```
 
-### With trajectory subset and custom interactions
+By default this also writes `contacts_frequencies.parquet` (per-residue-pair contact frequencies). Use `--no-frequencies` to skip this.
+
+### With an OpenMM system for accurate bond topology
+
+Strongly recommended for H-bond detection — PDB CONECT records are often missing:
 
 ```bash
-ultracontacts \
-  --topology system.psf \
-  --trajectory production.dcd \
-  --itypes hb sb ps ts pc vdw hp \
-  --beg 0 --end 999 --stride 2 \
+ultracontacts contacts \
+  --topology system.pdb \
+  --trajectory sim.dcd \
+  --openmm-system system.xml \
   --output contacts.parquet
 ```
 
-### Two-selection mode (e.g. protein–ligand)
+### Trajectory subset, custom interactions, two-selection mode
 
 ```bash
-ultracontacts \
-  --topology system.prmtop \
-  --trajectory md.nc \
+ultracontacts contacts \
+  --topology system.psf \
+  --trajectory production.dcd \
+  --itypes hb sb ps ts pc \
+  --beg 100 --end 4999 --stride 2 \
   --sele "protein" \
   --sele2 "resname LIG" \
-  --itypes hb sb vdw \
   --output prot_lig_contacts.parquet
 ```
 
-### Compute contact frequencies from output
+### Frequency output options
 
 ```bash
-ultracontacts \
-  --frequencies contacts.parquet \
-  --output contact_frequencies.tsv
+# Frequencies are written automatically — skip with:
+ultracontacts contacts ... --no-frequencies
+
+# Custom frequency file path (.tsv extension → TSV format):
+ultracontacts contacts ... --frequencies my_freqs.tsv
+
+# Also write condensed wide-format (one row, columns = "res1-res2" pair names):
+ultracontacts contacts ... --condensed
+```
+
+### Standalone frequency calculation
+
+```bash
+# Long format (itype, res1, res2, frequency, count):
+ultracontacts frequencies --input contacts.parquet --output freqs.parquet
+
+# Condensed wide-format (one row, residue pair column names, any-itype probability):
+ultracontacts frequencies --input contacts.parquet --output freqs_condensed.parquet --condensed
+
+# TSV output:
+ultracontacts frequencies --input contacts.parquet --output freqs.tsv
 ```
 
 ## Interaction Types
 
-| Flag | Name | Criteria |
-|------|------|----------|
-| `hb` | Hydrogen bond | D···A < 3.5 Å, D-H···A angle > 150° |
+| Flag | Name | Default Criteria |
+|------|------|-----------------|
+| `hb` | Hydrogen bond | D···A < 3.5 Å, D-H···A > 110° (matches VMD/getcontacts) |
 | `sb` | Salt bridge | Anion–cation distance < 4.0 Å |
 | `ps` | Pi-stacking | Centroid dist < 7.0 Å, plane angle < 30°, psi < 45° |
 | `ts` | T-stacking | Centroid dist < 5.0 Å, plane angle ≈ 90° ± 30°, psi ≈ 90° ± 45° |
 | `pc` | Pi-cation | Centroid–cation dist < 6.0 Å, normal–cation angle < 60° |
 | `vdw` | Van der Waals | Distance < r₁ + r₂ + 0.5 Å |
-| `hp` | Hydrophobic | C/S atoms < 4.0 Å (hydrophobic residues only) |
+| `hp` | Hydrophobic | C/S atoms < 4.0 Å (ALA, PHE, GLY, ILE, LEU, PRO, VAL, TRP) |
 
-Use `--itypes all` to compute all types.
+Use `--itypes all` to compute all types. Default: `hb sb ps ts pc`.
 
-## Output Format
+All geometric criteria can be overridden:
 
-Contacts are written to a Parquet file with columns:
+```bash
+ultracontacts contacts ... \
+  --hbond-cutoff-dist 3.2 \
+  --hbond-cutoff-ang 120 \
+  --vdw-epsilon 0.3
+```
+
+## Output Formats
+
+### Atomistic contacts Parquet
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `frame` | int32 | Trajectory frame index |
-| `itype` | string | Interaction type (e.g. `hb`, `sb`) |
+| `itype` | string | Interaction type (`hb`, `sb`, `ps`, `ts`, `pc`, `vdw`, `hp`) |
 | `atom1` | string | `chain:resname:resid:name` |
 | `atom2` | string | `chain:resname:resid:name` |
 
-Read with pandas:
+### Frequency Parquet (long format)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `itype` | string | Interaction type |
+| `res1` | string | `chain:resname:resid` (lexicographically ≤ res2) |
+| `res2` | string | `chain:resname:resid` |
+| `frequency` | float64 | Fraction of frames where contact occurs |
+| `count` | int64 | Number of frames |
+
+Canonical residue ordering matches [getcontacts](https://github.com/getcontacts/getcontacts): `res1 ≤ res2` lexicographically.
+
+### Condensed Parquet (wide format)
+
+One row. Columns are residue pair names `"res1-res2"`. Values are the fraction of frames where **any** contact of **any** type exists between that pair. Suitable for direct use in ML/statistics pipelines:
+
 ```python
-import pandas as pd
-df = pd.read_parquet("contacts.parquet")
-print(df.groupby("itype").size())
+import polars as pl
+df = pl.read_parquet("contacts_condensed.parquet")
+# shape: (1, N_pairs)
+# columns: ["A:ALA:1-A:ARG:5", "A:ALA:1-A:GLY:8", ...]
 ```
 
-## Geometric Criteria Overrides
+## Comparison with getcontacts
 
-All cutoffs can be overridden at the command line:
+ultracontacts uses the same geometric criteria and residue-pair ordering as [getcontacts](https://github.com/getcontacts/getcontacts) and produces compatible output, with these differences:
 
-```bash
-ultracontacts \
-  --topology protein.pdb \
-  --trajectory sim.dcd \
-  --output contacts.parquet \
-  --hbond-cutoff-dist 3.2 \
-  --hbond-cutoff-ang 140 \
-  --vdw-epsilon 0.3 \
-  --sb-cutoff-dist 5.0
-```
-
-Full list: `ultracontacts --help`
+- **VdW/HP sidechain contacts between adjacent residues**: ultracontacts reports these; getcontacts blanket-excludes all adjacent-residue VdW/HP pairs
+- **Speed**: ~150 fps on GPU vs ~1–5 fps for getcontacts on CPU
+- **No VMD dependency**: uses MDAnalysis + CuPy CUDA kernels
 
 ## Architecture
 
-Contacts are computed by five fused CUDA kernels (`kernels.py`) compiled via `cupy.RawKernel`:
+Static topology data (atom indices, masks, radii) is uploaded to GPU **once** at startup. Per-frame, only coordinate data (~70 KB) is transferred. Five fused CUDA raw kernels evaluate candidate pairs via `atomicAdd` without materialising the full N² distance matrix:
 
-- **`dist_contacts`** — simple distance threshold (sb, hp)
-- **`vdw_contacts`** — per-pair VDW cutoff from atomic radii (vdw)
-- **`hbond_contacts`** — distance + D-H···A angle (hb)
+- **`dist_contacts`** — distance threshold (sb, hp)
+- **`vdw_contacts`** — per-pair VdW cutoff from atomic radii (vdw)
+- **`hbond_contacts`** — D···A distance + D-H···A angle at H vertex (hb)
 - **`ring_stacking`** — centroid distance + plane angle + psi (ps, ts)
 - **`pi_cation`** — centroid distance + normal-cation angle (pc)
 
-Each kernel uses one CUDA thread per candidate pair and writes only passing pairs via `atomicAdd` — the full N² distance matrix is never materialized. Static data (atom indices, topology masks, radii) is uploaded to GPU once at startup; only coordinates (~70 KB/frame) are transferred per frame.
+Frequency calculations use **Polars lazy streaming** — bounded memory, Rust/SIMD string operations.
