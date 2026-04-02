@@ -1,8 +1,8 @@
 """
 hydrophobics.py — GPU-fused hydrophobic contact detection via CuPy.
 
-Criterion: two hydrophobic C/S atoms within HP_CUTOFF_DIST (default 4.0 Å),
-           in different residues.
+Criterion: two hydrophobic C/S atoms within r₁ + r₂ + VDW_EPSILON,
+           matching getcontacts per-pair VDW radii cutoff.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import numpy as np
 import cupy as cp
 
 from ..topology import ChemicalGroups, build_dual_sele_mask, build_residue_diff_mask
-from ..kernels import dist_contacts_gpu
+from ..kernels import vdw_contacts_gpu
 
 
 def precompute_hp_mask(groups: ChemicalGroups, res_diff: int) -> np.ndarray:
@@ -38,6 +38,7 @@ def precompute_hp_gpu(groups: ChemicalGroups, mask: np.ndarray) -> dict:
     return {
         "idx": cp.asarray(groups.hp_indices),
         "mask": cp.asarray(mask.ravel()),
+        "radii": cp.asarray(groups.hp_radii),
         "lbls": np.array(groups.hp_labels, dtype=object),
     }
 
@@ -48,14 +49,15 @@ def compute_hydrophobics(
     geom: dict,
     abs_frame: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    cutoff = float(geom.get("HP_CUTOFF_DIST", 4.0))
+    epsilon = float(geom.get("VDW_EPSILON", 0.5))
 
     if len(gpu_data["idx"]) == 0:
         return (np.empty(0, np.int32), np.empty(0, object), np.empty(0, object), np.empty(0, object))
 
-    i_hits, j_hits = dist_contacts_gpu(
+    i_hits, j_hits = vdw_contacts_gpu(
         coords_gpu, gpu_data["idx"], gpu_data["idx"],
-        gpu_data["mask"], cutoff ** 2,
+        gpu_data["mask"], gpu_data["radii"], gpu_data["radii"],
+        epsilon,
     )
     if len(i_hits) == 0:
         return (np.empty(0, np.int32), np.empty(0, object), np.empty(0, object), np.empty(0, object))

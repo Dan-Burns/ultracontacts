@@ -149,6 +149,7 @@ class ChemicalGroups:
     hp_chain: np.ndarray
     hp_resid: np.ndarray
     hp_is_bb: np.ndarray            # (Hp,) bool
+    hp_radii: np.ndarray            # (Hp,) float32 — VDW radii for per-pair cutoff
 
     # VdW — all heavy atoms in each selection
     vdw_indices1: np.ndarray        # (V1,)
@@ -409,7 +410,7 @@ def parse_topology(
     # HYDROPHOBICS
     # ===========================================================
     hp_idx_, hp_lbl_, hp_m1_, hp_m2_ = [], [], [], []
-    hp_chain_, hp_resid_, hp_is_bb_ = [], [], []
+    hp_chain_, hp_resid_, hp_is_bb_, hp_radii_ = [], [], [], []
 
     try:
         hp_sel_str = " or ".join(f"resname {r}" for r in HYDROPHOBIC_RESNAMES)
@@ -425,6 +426,7 @@ def parse_topology(
             hp_chain_.append(atom.chainID)
             hp_resid_.append(int(atom.resid))
             hp_is_bb_.append(atom.name in BACKBONE_NAMES)
+            hp_radii_.append(_get_vdw(atom.element))
     except Exception as e:
         print(f"[ultracontacts] Warning: hydrophobic group detection failed: {e}")
 
@@ -498,6 +500,7 @@ def parse_topology(
         hp_chain=np.array(hp_chain_, dtype=object),
         hp_resid=np.array(hp_resid_, dtype=np.int32) if hp_resid_ else np.empty(0, dtype=np.int32),
         hp_is_bb=_to_bool(hp_is_bb_),
+        hp_radii=np.array(hp_radii_, dtype=np.float32) if hp_radii_ else np.empty(0, dtype=np.float32),
         # vdw
         vdw_indices1=_to_i32(v1[0]),
         vdw_labels1=v1[1],
