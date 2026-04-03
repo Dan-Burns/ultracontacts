@@ -15,14 +15,17 @@ dependencies = [
     "polars",
     "tqdm",
     "rdkit",
-    "cupy",  # CUDA-version-specific builds available: cupy-cuda12x, cupy-cuda13x, etc.
-             # Install the matching build for your CUDA version before installing ultracontacts.
+    # cupy is intentionally omitted here — prebuilt wheels are CUDA-version-specific
+    # and cannot be auto-selected by pip. Install the matching wheel manually:
+    #   pip install cupy-cuda12x   # CUDA 12.x
+    #   pip install cupy-cuda13x   # CUDA 13.x
+    # or use: pip install ultracontacts[cuda12x]
 ]
 
 [project.optional-dependencies]
-cuda12 = ["cupy-cuda12x"]
-cuda13 = ["cupy-cuda13x"]
-cuda11 = ["cupy-cuda11x"]
+cuda12x = ["cupy-cuda12x"]
+cuda13x = ["cupy-cuda13x"]
+cuda11x = ["cupy-cuda11x"]
 
 [project.scripts]
 ultracontacts = "ultracontacts.cli:main"
