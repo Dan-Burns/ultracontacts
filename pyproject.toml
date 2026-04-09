@@ -26,6 +26,7 @@ dependencies = [
 cuda12x = ["cupy-cuda12x"]
 cuda13x = ["cupy-cuda13x"]
 cuda11x = ["cupy-cuda11x"]
+parmed = ["parmed"]
 
 [project.scripts]
 ultracontacts = "ultracontacts.cli:main"
