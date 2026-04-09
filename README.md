@@ -7,18 +7,45 @@ GPU-accelerated molecular contact analysis. Computes hydrogen bonds, salt bridge
 ## Requirements
 
 - NVIDIA GPU with CUDA support
-- [`cupy`](https://cupy.dev/) matching your CUDA version:
-  ```bash
-  pip install cupy-cuda12x   # CUDA 12
-  pip install cupy-cuda13x   # CUDA 13
-  ```
-- `MDAnalysis`, `pyarrow`, `polars`, `tqdm`, `numpy`
+- [`cupy`](https://cupy.dev/) matching your CUDA version (see [Installation](#installation))
+- `MDAnalysis`, `pyarrow`, `polars`, `tqdm`, `numpy`, `rdkit`
 
 ## Installation
 
+CuPy wheels are CUDA-version-specific and cannot be auto-selected by pip.
+Install the matching wheel for your CUDA runtime, then install ultracontacts:
+
 ```bash
+# Option A: install CuPy separately, then ultracontacts
+pip install cupy-cuda12x      # CUDA 12.x
+pip install ultracontacts
+
+# Option B: use the package extra shorthand
+pip install ultracontacts[cuda12x]    # CUDA 12.x
+pip install ultracontacts[cuda13x]    # CUDA 13.x
+pip install ultracontacts[cuda11x]    # CUDA 11.x
+```
+
+For development:
+
+```bash
+pip install cupy-cuda12x
 pip install -e .
 ```
+
+### Optional: ParmEd (for AMBER/GROMACS/CHARMM bond topology)
+
+If you want to load bond topology from AMBER `.prmtop`, GROMACS `.top`/`.tpr`,
+or CHARMM `.psf` files, install ParmEd:
+
+```bash
+pip install parmed
+# or
+pip install ultracontacts[parmed]
+```
+
+ParmEd is **not required** for OpenMM `system.xml` files or for basic usage
+with `guess_bonds`.
 
 ## Usage
 
@@ -33,17 +60,56 @@ ultracontacts contacts \
 
 By default this also writes `contacts_frequencies.parquet` (per-residue-pair contact frequencies). Use `--no-frequencies` to skip this.
 
-### With an OpenMM system for accurate bond topology
+### Bond topology for accurate H-bond detection
 
-Strongly recommended for H-bond detection — PDB CONECT records are often missing:
+Accurate H-bond detection requires knowing which atoms are covalently bonded.
+PDB CONECT records are often incomplete, so providing the simulation's bond
+topology is strongly recommended. The `--bond-topology` flag auto-detects the
+file format (Only tested with OpenMM system xml (4/8/2026)):
 
 ```bash
+# OpenMM
 ultracontacts contacts \
   --topology system.pdb \
   --trajectory sim.dcd \
-  --openmm-system system.xml \
+  --bond-topology system.xml \
+  --output contacts.parquet
+
+# AMBER
+ultracontacts contacts \
+  --topology stripped.pdb \
+  --trajectory sim.nc \
+  --bond-topology full_system.prmtop \
+  --output contacts.parquet
+
+# GROMACS
+ultracontacts contacts \
+  --topology stripped.pdb \
+  --trajectory sim.xtc \
+  --bond-topology topol.tpr \
+  --output contacts.parquet
+
+# CHARMM
+ultracontacts contacts \
+  --topology stripped.pdb \
+  --trajectory sim.dcd \
+  --bond-topology system.psf \
   --output contacts.parquet
 ```
+
+**Full-system topology files work correctly against solvent-stripped structures.**
+Bonds involving atom indices beyond the stripped structure are automatically
+filtered out — the same file you used to run the simulation can be passed
+directly, even if it contains water and ions that were removed from the
+trajectory.
+
+| Format | Extensions | Requires |
+|--------|-----------|----------|
+| OpenMM | `.xml` | (stdlib only) |
+| AMBER | `.prmtop`, `.parm7` | `parmed` |
+| GROMACS | `.top`, `.tpr` | `parmed` |
+| CHARMM | `.psf` | `parmed` |
+| Desmond | `.cms` | `parmed` |
 
 ### Trajectory subset, custom interactions, two-selection mode
 
