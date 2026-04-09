@@ -80,7 +80,7 @@ VDW_DEFAULT = 1.70
 
 
 # ---------------------------------------------------------------------------
-# OpenMM integration
+# Bond topology parsing — multi-engine support
 # ---------------------------------------------------------------------------
 def parse_openmm_bonds(xml_path: str, max_atoms: int | None = None) -> list[tuple[int, int]]:
     """
@@ -110,6 +110,69 @@ def parse_openmm_bonds(xml_path: str, max_atoms: int | None = None) -> list[tupl
                 bonds.add((min(i, j), max(i, j)))
 
     return list(bonds)
+
+
+def parse_parmed_bonds(topo_path: str, max_atoms: int | None = None) -> list[tuple[int, int]]:
+    """
+    Parse bond topology from any ParmEd-supported file format.
+
+    Supports AMBER (.prmtop, .parm7), GROMACS (.top, .tpr), CHARMM (.psf),
+    Desmond (.cms), and others.
+
+    Filters out bonds referencing atom indices >= max_atoms, so a full-system
+    topology file works correctly against a solvent-stripped structure.
+
+    Parameters
+    ----------
+    topo_path : str
+        Path to the topology file.
+    max_atoms : int, optional
+        If given, discard bonds involving atom indices >= this value.
+
+    Returns
+    -------
+    list[tuple[int, int]]
+        Sorted (i, j) bond pairs with i < j.
+    """
+    try:
+        import parmed
+    except ImportError:
+        raise ImportError(
+            "ParmEd is required to read bond topology from this file format.\n"
+            "Install it with:  pip install parmed\n"
+            "  or:  conda install -c conda-forge parmed"
+        )
+
+    struct = parmed.load_file(topo_path)
+    bonds = set()
+    for bond in struct.bonds:
+        i, j = bond.atom1.idx, bond.atom2.idx
+        if max_atoms is None or (i < max_atoms and j < max_atoms):
+            bonds.add((min(i, j), max(i, j)))
+    return list(bonds)
+
+
+# Extensions handled by the built-in OpenMM XML parser (no parmed needed)
+_OPENMM_EXTENSIONS = frozenset({".xml"})
+
+
+def parse_bond_topology(topo_path: str, max_atoms: int | None = None) -> list[tuple[int, int]]:
+    """
+    Unified bond-topology loader — auto-detects format from file extension.
+
+    - ``.xml``  → OpenMM system.xml parser (stdlib only, no parmed)
+    - Everything else → ParmEd (AMBER .prmtop, GROMACS .top/.tpr, CHARMM .psf, …)
+
+    The ``max_atoms`` filter ensures that a full-system topology file
+    (including solvent) works correctly against a solvent-stripped structure.
+    """
+    import os
+    ext = os.path.splitext(topo_path)[1].lower()
+
+    if ext in _OPENMM_EXTENSIONS:
+        return parse_openmm_bonds(topo_path, max_atoms=max_atoms)
+    else:
+        return parse_parmed_bonds(topo_path, max_atoms=max_atoms)
 
 
 
