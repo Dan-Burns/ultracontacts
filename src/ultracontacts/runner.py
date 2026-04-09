@@ -66,7 +66,8 @@ def compute_contacts(
     end: Optional[int] = None,
     stride: int = 1,
     output: str = "contacts.parquet",
-    openmm_system: Optional[str] = None,
+    openmm_system: Optional[str] = None,   # deprecated — use bond_topology
+    bond_topology: Optional[str] = None,
     n_gpus: Optional[int] = None,
     chunk_size: int = 25,  # kept for CLI compat, unused in CuPy path
 ) -> None:
@@ -95,18 +96,20 @@ def compute_contacts(
     else:
         u = mda.Universe(topology)
 
-    if openmm_system:
-        from .topology import parse_openmm_bonds
-        print(f"[ultracontacts] Loading bonds from OpenMM system: {openmm_system}")
+    # ---- Load bond topology from external file ----
+    bond_topo_path = bond_topology or openmm_system
+    if bond_topo_path:
+        from .topology import parse_bond_topology
+        print(f"[ultracontacts] Loading bonds from: {bond_topo_path}")
         try:
-            bonds = parse_openmm_bonds(openmm_system, max_atoms=len(u.atoms))
+            bonds = parse_bond_topology(bond_topo_path, max_atoms=len(u.atoms))
             if len(bonds) > 0:
                 u.add_TopologyAttr('bonds', bonds)
-                print(f"[ultracontacts] Assigned {len(bonds)} bonds from XML")
+                print(f"[ultracontacts] Assigned {len(bonds)} bonds")
             else:
-                print("[ultracontacts] Warning: XML parsed but 0 bonds found")
+                print("[ultracontacts] Warning: topology parsed but 0 bonds found")
         except Exception as e:
-            print(f"[ultracontacts] Error parsing OpenMM system: {e}")
+            print(f"[ultracontacts] Error parsing bond topology: {e}")
 
     if "hb" in itypes:
         n_bonds = 0
@@ -128,10 +131,10 @@ def compute_contacts(
                 if n_bonds_new < len(u.atoms) // 2:
                     print("[ultracontacts] ⚠ Bond guessing produced few bonds — "
                           "H-bond detection will be unreliable.\n"
-                          "  → Pass --openmm-system system.xml for accurate results.")
+                          "  → Pass --bond-topology <system.xml|.prmtop|.psf|…> for accurate results.")
             except Exception as e:
                 print(f"[ultracontacts] Warning: bond guessing failed: {e}\n"
-                      "  → Pass --openmm-system system.xml for H-bond detection.")
+                      "  → Pass --bond-topology <system.xml|.prmtop|.psf|…> for H-bond detection.")
 
     # ---- Parse chemical groups ----
     print("[ultracontacts] Parsing chemical groups…")
