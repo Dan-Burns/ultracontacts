@@ -99,8 +99,17 @@ def _build_contacts_parser(p: argparse.ArgumentParser):
                    help="MDAnalysis selection 1 [default: 'protein']")
     p.add_argument("--sele2",        metavar="STR", default=None,
                    help="MDAnalysis selection 2 [default: same as --sele]")
+    p.add_argument("--bond-topology", metavar="PATH", default=None,
+                   help="Topology file with bond info for H-bond detection.\n"
+                        "Auto-detected formats:\n"
+                        "  OpenMM  : system.xml\n"
+                        "  AMBER   : .prmtop, .parm7\n"
+                        "  GROMACS : .top, .tpr\n"
+                        "  CHARMM  : .psf\n"
+                        "Full-system files (with solvent) work correctly against\n"
+                        "solvent-stripped structures.")
     p.add_argument("--openmm-system", metavar="PATH", default=None,
-                   help="OpenMM system.xml for exact bond topology")
+                   help="[DEPRECATED — use --bond-topology] OpenMM system.xml")
     p.add_argument("--beg",          type=int, default=0, metavar="INT",
                    help="First frame [default: 0]")
     p.add_argument("--end",          type=int, default=None, metavar="INT",
@@ -161,6 +170,7 @@ def _run_contacts(args):
         stride=args.stride,
         output=args.output,
         openmm_system=args.openmm_system,
+        bond_topology=args.bond_topology,
         n_gpus=args.n_gpus,
     )
 
